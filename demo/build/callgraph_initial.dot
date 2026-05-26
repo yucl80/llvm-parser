@@ -1,0 +1,17 @@
+digraph "Call Graph" {
+	label="Call Graph";
+
+	Node0x567355d340e0 [shape=record,shape=box,label="{CallGraphNode ID: 0 \{fun: _Z2cai\}}"];
+	Node0x567355d2a1b0 [shape=record,shape=box,label="{CallGraphNode ID: 1 \{fun: _Z3addii\}|{<s0>1}}"];
+	Node0x567355d2a1b0:s0 -> Node0x567355d340e0[color=black];
+	Node0x567355d2a2f0 [shape=record,shape=box,label="{CallGraphNode ID: 2 \{fun: main\}|{<s0>2|<s1>3|<s2>4|<s3>5|<s4>6}}"];
+	Node0x567355d2a2f0:s0 -> Node0x567355d2a1b0[color=black];
+	Node0x567355d2a2f0:s1 -> Node0x567355cf8b40[color=black];
+	Node0x567355d2a2f0:s2 -> Node0x567355cf8c80[color=black];
+	Node0x567355d2a2f0:s3 -> Node0x567355d14f60[color=black];
+	Node0x567355d2a2f0:s4 -> Node0x567355cf8b40[color=black];
+	Node0x567355cf8b40 [shape=record,shape=Mrecord,label="{CallGraphNode ID: 3 \{fun: _ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc\}}"];
+	Node0x567355cf8c80 [shape=record,shape=Mrecord,label="{CallGraphNode ID: 4 \{fun: _ZNSolsEi\}}"];
+	Node0x567355cf8dc0 [shape=record,shape=Mrecord,label="{CallGraphNode ID: 5 \{fun: _ZSt4endlIcSt11char_traitsIcEERSt13basic_ostreamIT_T0_ES6_\}}"];
+	Node0x567355d14f60 [shape=record,shape=Mrecord,label="{CallGraphNode ID: 6 \{fun: _ZNSolsEPFRSoS_E\}}"];
+}
