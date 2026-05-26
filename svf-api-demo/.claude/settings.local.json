@@ -1,4 +1,4 @@
-{
+{ 
   "permissions": {
     "allow": [
       "Bash(ls:*)",
@@ -6,7 +6,10 @@
       "Bash(g++:*)",
       "Bash(/root/src/SVF/llvm-21.1.0.obj/bin/clang:*)",
       "Bash(/root/src/SVF/llvm-21.1.0.obj/bin/clang++:*)",
-      "Bash(LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib ./test_svf:*)"
+      "Bash(LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib ./test_svf:*)",
+      "Read(//root/src/SVF/llvm-21.1.0.obj/bin/**)",
+      "Read(//root/src/SVF/Release-build/lib/**)",
+      "Bash(./test_complex *)"
     ]
   }
 }

@@ -123,6 +123,134 @@ void testFuncPtrArray() {
     }
 }
 
+// ===== Function pointer as parameter (callback pattern) =====
+typedef int (*Comparator)(int, int);
+
+int compareAsc(int a, int b) {
+    return a - b;
+}
+
+int compareDesc(int a, int b) {
+    return b - a;
+}
+
+void sortWithCallback(int* arr, int n, Comparator cmp) {
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (cmp(arr[i], arr[j]) > 0) {
+                int tmp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = tmp;
+            }
+        }
+    }
+}
+
+void testCallbackParam() {
+    int arr1[] = {3, 1, 4, 1, 5};
+    sortWithCallback(arr1, 5, compareAsc);
+    sortWithCallback(arr1, 5, compareDesc);
+}
+
+// ===== Pointer to function pointer (double indirection) =====
+void targetViaDoublePtr() {
+    printf("called via pointer-to-function-pointer\n");
+}
+
+void testPtrToFuncPtr() {
+    FuncPtr fp = targetViaDoublePtr;
+    FuncPtr* fpp = &fp;       // pointer to function pointer
+    FuncPtr** fppp = &fpp;    // pointer to pointer to function pointer
+
+    // call through single indirection
+    fp();
+
+    // call through double indirection
+    FuncPtr fp2 = *fpp;
+    fp2();
+
+    // call through triple indirection
+    FuncPtr fp3 = **fppp;
+    fp3();
+}
+
+// ===== Function pointer as struct member =====
+typedef void (*HandlerFunc)(int);
+
+struct Handler {
+    int id;
+    HandlerFunc onEvent;
+};
+
+void handleEventA(int val) {
+    printf("Handler A: %d\n", val);
+}
+
+void handleEventB(int val) {
+    printf("Handler B: %d\n", val);
+}
+
+void testStructFuncPtr() {
+    Handler h1 = {1, handleEventA};
+    Handler h2 = {2, handleEventB};
+
+    h1.onEvent(h1.id);
+    h2.onEvent(h2.id);
+
+    // swap function pointers between structs
+    HandlerFunc tmp = h1.onEvent;
+    h1.onEvent = h2.onEvent;
+    h2.onEvent = tmp;
+
+    h1.onEvent(99);
+    h2.onEvent(99);
+}
+
+// ===== Function returning a function pointer =====
+FuncPtr chooseHandler(int kind) {
+    if (kind == 0)
+        return fa;
+    else
+        return fb;
+}
+
+void testReturnFuncPtr() {
+    FuncPtr f = chooseHandler(0);
+    f();
+
+    f = chooseHandler(1);
+    f();
+
+    // chain: call through returned function pointer without intermediate variable
+    chooseHandler(0)();
+}
+
+// ===== Array of pointers to function pointers =====
+void testArrayOfPtrToFuncPtr() {
+    FuncPtr fns[2] = {fa, fb};
+    FuncPtr* fptrs[2] = {&fns[0], &fns[1]};
+
+    // call via pointer-to-function-pointer from array
+    (*fptrs[0])();
+    (*fptrs[1])();
+}
+
+// ===== Nested callback: function pointer passed through multiple layers =====
+void middleWare(int x, int y, Comparator cmp, void (*report)(int)) {
+    int result = cmp(x, y);
+    report(result);
+}
+
+void reportResult(int val) {
+    printf("result: %d\n", val);
+}
+
+void testNestedCallback() {
+    // Comparator passed through middleware
+    middleWare(10, 20, compareAsc, reportResult);
+    middleWare(10, 20, compareDesc, reportResult);
+}
+
 // ===== Main =====
 int main() {
     directCall();
@@ -132,5 +260,11 @@ int main() {
     testVirtualDispatch();
     testLambda();
     testFuncPtrArray();
+    testCallbackParam();
+    testPtrToFuncPtr();
+    testStructFuncPtr();
+    testReturnFuncPtr();
+    testArrayOfPtrToFuncPtr();
+    testNestedCallback();
     return 0;
 }
