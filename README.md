@@ -39,11 +39,50 @@ The complex test covers the following call patterns that SVF's pointer analysis 
 ### Virtual Dispatch
 - Single virtual inheritance: `Base* b = new Derived(); b->virtualMethod();`
 - Polymorphic array: `Animal* animals[3]` holding `Animal`, `Dog`, `Cat` instances, iterated in a loop
+- **Multiple inheritance**: `MultiDerived` inherits from both `MixinA` and `MixinB`, each with virtual methods; calls dispatch through each base pointer with this-pointer adjustment
+- **Diamond virtual inheritance**: `DiamondTip` inherits from `MidLeft` and `MidRight`, both virtually derived from `DiamondBase`; virtual base pointer resolution
+- **Abstract base class dispatch**: `AbstractBase` with pure virtual `doit()`/`report()`, dispatched through array of `ConcreteA`/`ConcreteB` pointers
+- **Multi-level virtual chain**: `VBase → VMid → VDerived` three-level override hierarchy dispatched through base pointer array
+- **Virtual calls in constructor/destructor**: `TraceDerived` calls virtual `log()` during construction and destruction (dynamic type changes during these contexts)
 
 ### Lambdas
 - Stateless lambda: `[](){}`
 - Capture-by-value lambda with return: `[x](int y) -> int`
 - Capture-by-reference lambda calling another function
+- **Generic lambda (C++14)**: `[](auto a, auto b){}` — templated call operator instantiated with `int` and `double`
+- **Capture by move (C++14)**: `[p = ptr](){}` — lambda captures a dynamically allocated pointer via move
+- **Nested lambda**: Lambda `makeAdder()` returns a capturing lambda; closure-in-closure call chain
+- **Lambda wrapped in std::function**: Stateless lambda assigned to `std::function<void()>`, invoked through the type-erased wrapper
+
+### Modern C++ Callable Wrappers
+- **std::function**: Wraps free functions (`stdFuncTarget1`, `stdFuncTarget2`), a lambda, and supports reassignment between targets
+- **std::bind**: Binds arguments to `bindTarget(a,b,c)` using `std::placeholders`, creating callable objects with fewer parameters
+- **std::function + bind**: A `std::function<void()>` wrapping a `std::bind` expression
+- **std::invoke (C++17)**: Unified call syntax invoking a free function, a member function (`Calculator::add` via pointer-to-member), and a lambda
+
+### Member Pointers & Functors
+- **Pointer to member function**: `int (Calculator::*MathOp)(int,int)` called via `.*` and `->*` syntax on instances of `Calculator`, selecting `add`, `sub`, `mul` at runtime
+- **Functor (function object)**: `Greeter` class with `operator()(const char*)` — different instances hold different state; calling `hello("World")` vs `goodbye("World")` dispatches to the same operator with different internal data
+
+### Function Pointer Advanced Patterns
+- **Ternary/conditional dispatch**: `FuncPtr f = flag ? condTrue : condFalse;` — runtime condition selects between two function pointers
+- **State machine with function pointer table**: `StateHandler states[3] = {stateIdle, stateRunning, stateStopped};` dispatched in a loop
+- **Function pointer reassignment in loop**: `FuncPtr fp` reassigned each iteration through a loop over `fns[]` array
+- **Struct dispatch table**: `DispatchEntry` struct array with `name` string and `handler` function pointer; iterated and invoked
+- **Function pointer on struct with operator()**: `CallableOps` struct wrapping a function pointer, called via `operator()()` overload
+
+### Recursion
+- **Direct recursion**: `factorial(n)` calls itself with `n-1`
+- **Mutual recursion**: `mutualA()` and `mutualB()` call each other alternately with decreasing counter
+
+### Template & Generic Patterns
+- **Function templates**: `maxOf<int>(3,7)` and `maxOf<double>(3.14,2.72)` — different template instantiations produce distinct call targets
+- **Variadic function template**: `varargSink(1,2,3,4,5)` — recursive template instantiation over parameter pack
+- **CRTP (Curiously Recurring Template Pattern)**: `ShapeBase<Derived>::draw()` calls `static_cast<Derived*>(this)->drawImpl()`, resolved at compile time to `Circle::drawImpl()` or `Square::drawImpl()`
+
+### Other C++ Features
+- **Default arguments**: `defaultArgsFunc(1)`, `defaultArgsFunc(2,20)`, `defaultArgsFunc(3,30,"explicit")` — calls with different argument counts expand differently at IR level
+- **Operator overloading**: Built-in `operator+` called on `int` operands to verify operator call edges
 
 ## Build & Usage
 
