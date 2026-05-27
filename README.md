@@ -138,9 +138,32 @@ g++ test.o a.o -o test_svf \
 
 ### Run Analysis
 
+The analyzer supports multiple analysis modes via CLI flags:
+
+| Flag | Description |
+|------|-------------|
+| *(default)* | AndersenWaveDiff — flow-insensitive, context-insensitive |
+| `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis |
+| `--vfs` | VersionedFlowSensitive (VFS_WPA) — versioned flow-sensitive |
+| `--cs` | Context-sensitive SVFG (default is already context-sensitive) |
+| `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) |
+
 ```bash
+# Default: flow-insensitive, context-insensitive
 LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
   ./test_svf test_complex.bc
+
+# Flow-sensitive
+LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
+  ./test_svf --fs test_complex.bc
+
+# Flow-sensitive + context-sensitive SVFG + heap object model
+LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
+  ./test_svf --fs --cs --heap-model test_complex.bc
+
+# Versioned flow-sensitive (object versioning)
+LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
+  ./test_svf --vfs test_complex.bc
 ```
 
 ### Run Test Program
