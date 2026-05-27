@@ -1,8 +1,11 @@
 // Complex test case for call graph analysis
-// Covers: function pointers, virtual inheritance, lambdas
+// Covers: function pointers, virtual inheritance, lambdas, modern C++ dispatch patterns
 
 #include <cstdio>
 #include <functional>
+#include <map>
+#include <variant>
+#include <tuple>
 
 // ===== Basic functions =====
 void directCall() {
@@ -699,6 +702,207 @@ void testMultiLevelVirtual() {
     }
 }
 
+// ===== 36. std::mem_fn =====
+void testMemFn() {
+    Calculator calc;
+
+    auto addFn = std::mem_fn(&Calculator::add);
+    addFn(calc, 20, 10);
+
+    auto subFn = std::mem_fn(&Calculator::sub);
+    subFn(&calc, 20, 10);
+}
+
+// ===== 37. std::bind with member function =====
+void testBindMemberFunc() {
+    Calculator calc;
+    using namespace std::placeholders;
+
+    // bind member function with instance pointer
+    auto boundAdd = std::bind(&Calculator::add, &calc, _1, _2);
+    boundAdd(30, 15);
+
+    auto boundSub = std::bind(&Calculator::sub, &calc, _1, _2);
+    boundSub(30, 15);
+}
+
+// ===== 38. Delegate pattern (std::function as class member) =====
+class Button {
+    std::function<void()> onClick_;
+    std::function<void(int)> onKey_;
+
+public:
+    void setOnClick(std::function<void()> cb) { onClick_ = std::move(cb); }
+    void setOnKey(std::function<void(int)> cb) { onKey_ = std::move(cb); }
+
+    void click() {
+        if (onClick_) onClick_();
+    }
+
+    void keyPress(int k) {
+        if (onKey_) onKey_(k);
+    }
+};
+
+void delegateClickA() { printf("Button A clicked\n"); }
+void delegateClickB() { printf("Button B clicked\n"); }
+void delegateKeyHandler(int code) { printf("Key pressed: %d\n", code); }
+
+void testDelegatePattern() {
+    Button btn1, btn2;
+
+    btn1.setOnClick(delegateClickA);
+    btn2.setOnClick(delegateClickB);
+    btn1.setOnKey(delegateKeyHandler);
+    btn2.setOnKey(delegateKeyHandler);
+
+    btn1.click();
+    btn2.click();
+    btn1.keyPress(42);
+    btn2.keyPress(99);
+
+    // reassign delegate dynamically
+    btn1.setOnClick(delegateClickB);
+    btn1.click();
+}
+
+// ===== 39. Dispatch table using std::map =====
+void mapCmdStart() { printf("cmd: start\n"); }
+void mapCmdStop() { printf("cmd: stop\n"); }
+void mapCmdStatus() { printf("cmd: status\n"); }
+
+void testMapDispatch() {
+    std::map<int, FuncPtr> dispatch;
+    dispatch[0] = mapCmdStart;
+    dispatch[1] = mapCmdStop;
+    dispatch[2] = mapCmdStatus;
+
+    for (int i = 0; i < 3; i++) {
+        auto it = dispatch.find(i);
+        if (it != dispatch.end()) {
+            it->second();
+        }
+    }
+}
+
+// ===== 40. if constexpr dispatch (C++17) =====
+template <bool UseFast>
+void algoDispatch() {
+    if constexpr (UseFast) {
+        printf("fast path\n");
+    } else {
+        printf("slow path\n");
+    }
+}
+
+template <typename T>
+void processIfConstexpr(T val) {
+    if constexpr (std::is_integral_v<T>) {
+        printf("integral: %d\n", (int)val);
+    } else {
+        printf("non-integral\n");
+    }
+}
+
+void testIfConstexpr() {
+    algoDispatch<true>();
+    algoDispatch<false>();
+
+    processIfConstexpr(42);
+    processIfConstexpr(3.14);
+}
+
+// ===== 41. Fold expression calling functions (C++17) =====
+void foldTarget(int v) { printf("fold target: %d\n", v); }
+
+template <typename... Args>
+void multiCallFold(Args... args) {
+    (foldTarget(args), ...);  // fold over comma operator
+}
+
+template <typename... Fns>
+void callAll(Fns... fns) {
+    (fns(), ...);  // expand function pointer pack with comma fold
+}
+
+void foldFnA() { printf("fold fn A\n"); }
+void foldFnB() { printf("fold fn B\n"); }
+void foldFnC() { printf("fold fn C\n"); }
+
+void testFoldExpression() {
+    multiCallFold(10, 20, 30);
+    callAll(foldFnA, foldFnB, foldFnC);
+}
+
+// ===== 42. std::apply with function and tuple =====
+int applyTarget(int a, double b, const char* c) {
+    printf("apply: %d %.1f %s\n", a, b, c);
+    return a;
+}
+
+void testStdApply() {
+    auto tup = std::make_tuple(42, 3.14, "hello");
+    std::apply(applyTarget, tup);
+
+    // apply with lambda
+    std::apply([](int x, int y) { printf("apply lambda: %d\n", x + y); },
+               std::make_tuple(10, 20));
+}
+
+// ===== 43. Overloaded lambda pattern (C++17) =====
+template <typename... Ts>
+struct Overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+template <typename... Ts>
+Overloaded(Ts...) -> Overloaded<Ts...>;
+
+void overloadIntFn(int v) { printf("overloaded int: %d\n", v); }
+void overloadStrFn(const char* s) { printf("overloaded str: %s\n", s); }
+
+void testOverloadedLambda() {
+    auto visitor = Overloaded{
+        [](int v) { overloadIntFn(v); },
+        [](const char* s) { overloadStrFn(s); },
+    };
+
+    visitor(42);
+    visitor("hello world");
+}
+
+// ===== 44. std::variant + std::visit =====
+void variantIntHandler(int v) { printf("variant int: %d\n", v); }
+void variantDoubleHandler(double v) { printf("variant double: %f\n", v); }
+void variantStrHandler(const char* v) { printf("variant str: %s\n", v); }
+
+using VariantType = std::variant<int, double, const char*>;
+
+void testVariantVisit() {
+    VariantType vars[3] = {42, 3.14, "variant"};
+
+    for (auto& v : vars) {
+        std::visit(Overloaded{
+            [](int x) { variantIntHandler(x); },
+            [](double x) { variantDoubleHandler(x); },
+            [](const char* x) { variantStrHandler(x); },
+        }, v);
+    }
+}
+
+// ===== 45. Recursive lambda via std::function =====
+void testRecursiveLambda() {
+    std::function<int(int)> fib = [&fib](int n) -> int {
+        if (n <= 1) return n;
+        printf("fib(%d)\n", n);
+        return fib(n - 1) + fib(n - 2);
+    };
+
+    int r = fib(4);
+    printf("fib result: %d\n", r);
+    (void)r;
+}
+
 // ===== Main =====
 int main() {
     directCall();
@@ -738,5 +942,15 @@ int main() {
     testStructDispatchTable();
     testStdInvoke();
     testMultiLevelVirtual();
+    testMemFn();
+    testBindMemberFunc();
+    testDelegatePattern();
+    testMapDispatch();
+    testIfConstexpr();
+    testFoldExpression();
+    testStdApply();
+    testOverloadedLambda();
+    testVariantVisit();
+    testRecursiveLambda();
     return 0;
 }

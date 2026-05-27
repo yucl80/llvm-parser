@@ -44,6 +44,7 @@ The complex test covers the following call patterns that SVF's pointer analysis 
 - **Abstract base class dispatch**: `AbstractBase` with pure virtual `doit()`/`report()`, dispatched through array of `ConcreteA`/`ConcreteB` pointers
 - **Multi-level virtual chain**: `VBase → VMid → VDerived` three-level override hierarchy dispatched through base pointer array
 - **Virtual calls in constructor/destructor**: `TraceDerived` calls virtual `log()` during construction and destruction (dynamic type changes during these contexts)
+- **Pure virtual call in base destructor**: `AbstractBase::~AbstractBase()` dispatches via `llvm.trap` (undefined behavior guard)
 
 ### Lambdas
 - Stateless lambda: `[](){}`
@@ -83,6 +84,18 @@ The complex test covers the following call patterns that SVF's pointer analysis 
 ### Other C++ Features
 - **Default arguments**: `defaultArgsFunc(1)`, `defaultArgsFunc(2,20)`, `defaultArgsFunc(3,30,"explicit")` — calls with different argument counts expand differently at IR level
 - **Operator overloading**: Built-in `operator+` called on `int` operands to verify operator call edges
+
+### C++17 Callable & Dispatch Patterns (New)
+- **std::mem_fn**: `std::mem_fn(&Calculator::add)` wraps a member function pointer into a callable, invoked via `_Mem_fn::operator()` with `__invoke_memfun_ref` / `__invoke_memfun_deref` paths
+- **std::bind with member function**: `std::bind(&Calculator::add, &calc, _1, _2)` — binds a member function pointer with an instance pointer and placeholders, creating a complex nested call chain through `_Bind::__call` → `__invoke_memfun_deref`
+- **Delegate pattern**: `Button` class stores `std::function<void()>` / `std::function<void(int)>` as members. Callbacks (`delegateClickA/B`, `delegateKeyHandler`) are dynamically registered with `setOnClick`/`setOnKey` and dispatched through `operator()` — includes runtime reassignment
+- **std::map dispatch table**: `std::map<int, FuncPtr>` storing `mapCmdStart`/`mapCmdStop`/`mapCmdStatus`, looked up via `find()` and invoked through `it->second()`
+- **if constexpr dispatch (C++17)**: `algoDispatch<true>()` vs `algoDispatch<false>()` — compile-time branch elimination via `if constexpr`, only the selected path survives in IR
+- **Fold expression call (C++17)**: `(foldTarget(args), ...)` expands a parameter pack over the comma operator into sequential calls; `(fns(), ...)` calls a pack of function pointers
+- **std::apply (C++17)**: `std::apply(applyTarget, tuple)` unpacks a tuple into function arguments; also tested with a lambda
+- **Overloaded lambda pattern (C++17)**: `Overloaded{[](int){}, [](const char*){}}` uses variadic `using Ts::operator()...` and CTAD deduction guide to create a multi-overload callable; dispatched through the synthesized `operator()`
+- **std::variant + std::visit**: `VariantType = std::variant<int, double, const char*>` visited in a loop with an `Overloaded` visitor, dispatching to `variantIntHandler` / `variantDoubleHandler` / `variantStrHandler` per alternative
+- **Recursive lambda via std::function**: Lambda that captures itself by reference (`[&fib]`) in a `std::function<int(int)>` and calls `fib(n-1) + fib(n-2)` recursively to compute Fibonacci, relying on type-erased self-reference
 
 ## Build & Usage
 
