@@ -32,19 +32,79 @@ mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
 SRC_ROOT=".."
 
 # ========================= 实测可用构建逻辑 =========================
-# 1. CMake (正确追加参数，保留所有原有配置)
+# 1. CMake (先正常编译，再用 compile_commands.json 重放生成 .bc)
 if [ -f "$SRC_ROOT/CMakeLists.txt" ]; then
     echo -e "\n🔨 检测到 CMake，保留所有配置"
     cmake \
         -DCMAKE_C_COMPILER="$CLANG_CC" \
         -DCMAKE_CXX_COMPILER="$CLANG_CXX" \
-        -DCMAKE_C_FLAGS="-emit-llvm" \
-        -DCMAKE_CXX_FLAGS="-emit-llvm" \
+        -DCMAKE_CXX_COMPILER_FORCED=TRUE \
+        -DCMAKE_C_COMPILER_FORCED=TRUE \
+        -DCMAKE_C_FLAGS="" \
+        -DCMAKE_CXX_FLAGS="" \
         -DCMAKE_C_FLAGS_DEBUG="" \
         -DCMAKE_C_FLAGS_RELEASE="" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         "$SRC_ROOT"
     make -j$(nproc)
+
+    echo -e "\n🔁 重放编译生成 LLVM 字节码..."
+    if command -v python3 &>/dev/null && [ -f compile_commands.json ]; then
+        python3 << 'PYEOF'
+import json, os, subprocess, shlex
+
+cwd = os.getcwd()
+with open('compile_commands.json') as f:
+    cmds = json.load(f)
+
+for entry in cmds:
+    src = entry.get('file', '')
+    if not any(src.endswith(ext) for ext in ['.c', '.cc', '.cpp', '.cxx', '.C']):
+        continue
+
+    directory = entry.get('directory', cwd)
+    if 'arguments' in entry and len(entry['arguments']) > 1:
+        args = list(entry['arguments'])
+    else:
+        cmd_str = entry.get('command', '')
+        args = shlex.split(cmd_str)
+
+    # 跳过链接命令（不是编译命令）
+    if not any(src in a for a in args[1:] if not a.startswith('-')):
+        continue
+
+    compiler = args[0] if args else 'clang++'
+
+    # 提取编译标志，排除 -o、-c、-g、-O 等
+    filtered = []
+    skip_next = False
+    for i, a in enumerate(args[1:], 1):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ('-c', '-o', '-g', '-g0', '-g1', '-g2', '-g3'):
+            continue
+        if a == '-o' and i + 1 < len(args):
+            skip_next = True
+            continue
+        if a.startswith('-O'):
+            continue
+        filtered.append(a)
+
+    basename = os.path.splitext(os.path.basename(src))[0] + '.bc'
+    outpath = os.path.join(cwd, basename)
+
+    cmd = [compiler, '-emit-llvm', '-c'] + filtered + ['-o', outpath]
+    try:
+        subprocess.run(cmd, cwd=directory, capture_output=True, check=True)
+        print(f"  ✅ {basename}")
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode().strip() if e.stderr else 'unknown error'
+        print(f"  ⚠️  {basename} 失败: {err[:120]}")
+PYEOF
+    else
+        echo "⚠️  未找到 python3 或 compile_commands.json，跳过 .bc 生成"
+    fi
 
 # 2. Autotools (configure 正确继承原有配置)
 elif [ -f "$SRC_ROOT/configure" ]; then
@@ -56,15 +116,28 @@ elif [ -f "$SRC_ROOT/configure" ]; then
     "$SRC_ROOT/configure"
     make -j$(nproc)
 
-# 3. 原生 Makefile (正确追加，不覆盖原有配置)
+# 3. 原生 Makefile — 分别提取编译+链接，避免 -emit-llvm 传入链接
 elif [ -f "$SRC_ROOT/Makefile" ]; then
     echo -e "\n🔨 检测到 Makefile"
     make -C "$SRC_ROOT" clean
+    # 先编译：传递 -emit-llvm 到 CFLAGS/CXXFLAGS
     make -C "$SRC_ROOT" \
         CC="$CLANG_CC" \
         CXX="$CLANG_CXX" \
+        CFLAGS="-emit-llvm" \
+        CXXFLAGS="-emit-llvm" \
         EXTRA_CFLAGS="-emit-llvm" \
         EXTRA_CXXFLAGS="-emit-llvm"
+    # 然后分别链接 (不传 -emit-llvm) - 用原始 Makefile 的默认链接规则
+    make -C "$SRC_ROOT" \
+        CC="$CLANG_CC" \
+        CXX="$CLANG_CXX" \
+        CFLAGS="" \
+        CXXFLAGS="" \
+        EXTRA_CFLAGS="" \
+        EXTRA_CXXFLAGS="" \
+        LDFLAGS="" \
+        LDLIBS=""
 
 # 4. Meson
 elif [ -f "$SRC_ROOT/meson.build" ]; then
