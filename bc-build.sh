@@ -10,8 +10,8 @@ BUILD_DIR="build_llvm_safe"
 # =======================================================================
 
 echo "============================================="
-echo "  🔒 安全版：C/C++ 工程 → LLVM 字节码（已实测）"
-echo "  ✅ 完全保留原有编译配置 | 无侵入 | 不覆盖参数"
+echo "  🔒 安全版：C/C++ 工程 → LLVM 字节码（简洁模式）"
+echo "  ✅ 思路：-emit-llvm 下 .o 文件本身就是 LLVM 字节码"
 echo "  支持：CMake / Autotools / Makefile / Meson"
 echo "============================================="
 echo "使用编译器: $CLANG_CC / $CLANG_CXX"
@@ -31,8 +31,49 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
 SRC_ROOT=".."
 
-# ========================= 实测可用构建逻辑 =========================
-# 1. CMake (先正常编译，再用 compile_commands.json 重放生成 .bc)
+# 收集 .o → 复制为 .bc → llvm-link
+# .o 文件在 -emit-llvm 下实际是 LLVM bitcode，可直接用 llvm-link 合并
+collect_bc() {
+    echo -e "\n📦 收集字节码..."
+    find . -name "*.o" -type f 2>/dev/null \
+        | grep -v "/CMakeFiles/CMake" \
+        | grep -v "_deps" \
+        | sort > o_files.list || true
+
+    if [ ! -s o_files.list ]; then
+        echo "❌ 未生成 .o 文件"
+        return 1
+    fi
+
+    bc_list=""
+    while read -r ofile; do
+        # 跳过非 bitcode 文件（如 CMake 探针生成的 ELF .o）
+        if ! file "$ofile" | grep -qi "LLVM IR bitcode"; then
+            continue
+        fi
+        bcname="$(basename "$ofile" .o).bc"
+        cp "$ofile" "./$bcname"
+        bc_list="$bc_list ./$bcname"
+    done < o_files.list
+
+    if [ -z "$bc_list" ]; then
+        echo "❌ 没有找到有效的 LLVM bitcode .o 文件"
+        return 1
+    fi
+
+    echo "✅ 找到 $(echo $bc_list | wc -w) 个 bitcode 文件"
+    $LLVM_LINK -o project_all.bc $bc_list
+    $LLVM_DIS project_all.bc -o project_all.ll
+
+    echo -e "\n============================================="
+    echo "🎉 全部完成！"
+    echo "📦 项目字节码: $BUILD_DIR/project_all.bc"
+    echo "📄 可读IR文件: $BUILD_DIR/project_all.ll"
+    echo "============================================="
+}
+
+# ========================= 构建逻辑 =========================
+# 1. CMake
 if [ -f "$SRC_ROOT/CMakeLists.txt" ]; then
     echo -e "\n🔨 检测到 CMake，保留所有配置"
     cmake \
@@ -40,104 +81,43 @@ if [ -f "$SRC_ROOT/CMakeLists.txt" ]; then
         -DCMAKE_CXX_COMPILER="$CLANG_CXX" \
         -DCMAKE_CXX_COMPILER_FORCED=TRUE \
         -DCMAKE_C_COMPILER_FORCED=TRUE \
-        -DCMAKE_C_FLAGS="" \
-        -DCMAKE_CXX_FLAGS="" \
-        -DCMAKE_C_FLAGS_DEBUG="" \
-        -DCMAKE_C_FLAGS_RELEASE="" \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DCMAKE_C_FLAGS="-emit-llvm" \
+        -DCMAKE_CXX_FLAGS="-emit-llvm" \
         "$SRC_ROOT"
-    make -j$(nproc)
+    echo -e "\n⚡ 编译中（-emit-llvm 下 .o 即是 .bc，链接失败可忽略）..."
+    make -j$(nproc) -k || true
+    collect_bc
 
-    echo -e "\n🔁 重放编译生成 LLVM 字节码..."
-    if command -v python3 &>/dev/null && [ -f compile_commands.json ]; then
-        python3 << 'PYEOF'
-import json, os, subprocess, shlex
-
-cwd = os.getcwd()
-with open('compile_commands.json') as f:
-    cmds = json.load(f)
-
-for entry in cmds:
-    src = entry.get('file', '')
-    if not any(src.endswith(ext) for ext in ['.c', '.cc', '.cpp', '.cxx', '.C']):
-        continue
-
-    directory = entry.get('directory', cwd)
-    if 'arguments' in entry and len(entry['arguments']) > 1:
-        args = list(entry['arguments'])
-    else:
-        cmd_str = entry.get('command', '')
-        args = shlex.split(cmd_str)
-
-    # 跳过链接命令（不是编译命令）
-    if not any(src in a for a in args[1:] if not a.startswith('-')):
-        continue
-
-    compiler = args[0] if args else 'clang++'
-
-    # 提取编译标志，排除 -o、-c、-g、-O 等
-    filtered = []
-    skip_next = False
-    for i, a in enumerate(args[1:], 1):
-        if skip_next:
-            skip_next = False
-            continue
-        if a in ('-c', '-o', '-g', '-g0', '-g1', '-g2', '-g3'):
-            continue
-        if a == '-o' and i + 1 < len(args):
-            skip_next = True
-            continue
-        if a.startswith('-O'):
-            continue
-        filtered.append(a)
-
-    basename = os.path.splitext(os.path.basename(src))[0] + '.bc'
-    outpath = os.path.join(cwd, basename)
-
-    cmd = [compiler, '-emit-llvm', '-c'] + filtered + ['-o', outpath]
-    try:
-        subprocess.run(cmd, cwd=directory, capture_output=True, check=True)
-        print(f"  ✅ {basename}")
-    except subprocess.CalledProcessError as e:
-        err = e.stderr.decode().strip() if e.stderr else 'unknown error'
-        print(f"  ⚠️  {basename} 失败: {err[:120]}")
-PYEOF
-    else
-        echo "⚠️  未找到 python3 或 compile_commands.json，跳过 .bc 生成"
-    fi
-
-# 2. Autotools (configure 正确继承原有配置)
+# 2. Autotools
 elif [ -f "$SRC_ROOT/configure" ]; then
     echo -e "\n🔨 检测到 Autotools"
     export CC="$CLANG_CC"
     export CXX="$CLANG_CXX"
     export CFLAGS="-emit-llvm"
     export CXXFLAGS="-emit-llvm"
-    "$SRC_ROOT/configure"
-    make -j$(nproc)
+    # 先在不带 -emit-llvm 的情况下 configure（避免链接检测失败）
+    export CFLAGS="" CXXFLAGS=""
+    "$SRC_ROOT/configure" || true
+    # 然后编译注入 -emit-llvm
+    export CFLAGS="-emit-llvm" CXXFLAGS="-emit-llvm"
+    make -j$(nproc) -k || true
+    # Autotools 的 .o 文件生成在源码树中，复制过来
+    find "$SRC_ROOT" -maxdepth 2 -name "*.o" -type f -exec cp {} . \; 2>/dev/null || true
+    collect_bc
 
-# 3. 原生 Makefile — 分别提取编译+链接，避免 -emit-llvm 传入链接
+# 3. 原生 Makefile
 elif [ -f "$SRC_ROOT/Makefile" ]; then
     echo -e "\n🔨 检测到 Makefile"
-    make -C "$SRC_ROOT" clean
-    # 先编译：传递 -emit-llvm 到 CFLAGS/CXXFLAGS
+    make -C "$SRC_ROOT" clean || true
     make -C "$SRC_ROOT" \
         CC="$CLANG_CC" \
         CXX="$CLANG_CXX" \
         CFLAGS="-emit-llvm" \
         CXXFLAGS="-emit-llvm" \
-        EXTRA_CFLAGS="-emit-llvm" \
-        EXTRA_CXXFLAGS="-emit-llvm"
-    # 然后分别链接 (不传 -emit-llvm) - 用原始 Makefile 的默认链接规则
-    make -C "$SRC_ROOT" \
-        CC="$CLANG_CC" \
-        CXX="$CLANG_CXX" \
-        CFLAGS="" \
-        CXXFLAGS="" \
-        EXTRA_CFLAGS="" \
-        EXTRA_CXXFLAGS="" \
-        LDFLAGS="" \
-        LDLIBS=""
+        -j$(nproc) -k || true
+    # Makefile 的 .o 文件生成在源码树中，复制过来
+    find "$SRC_ROOT" -maxdepth 2 -name "*.o" -type f -exec cp {} . \; 2>/dev/null || true
+    collect_bc
 
 # 4. Meson
 elif [ -f "$SRC_ROOT/meson.build" ]; then
@@ -148,29 +128,10 @@ c='$CLANG_CC'
 cpp='$CLANG_CXX'") \
         -Dc_args="-emit-llvm" \
         -Dcpp_args="-emit-llvm"
-    ninja
+    ninja -k0 || true
+    collect_bc
 
 else
     echo -e "\n❌ 未支持的构建系统"
     exit 1
 fi
-
-# ========================= 收集 & 合并字节码 =========================
-echo -e "\n✅ 编译完成，收集字节码..."
-find . -name "*.bc" -type f | grep -v "_deps" | sort > bc_files.list
-BC_CNT=$(wc -l < bc_files.list)
-
-if [ "$BC_CNT" -eq 0 ]; then
-    echo "❌ 未生成 .bc 文件，但编译成功（配置已完整保留）"
-    exit 1
-fi
-
-echo "✅ 找到 $BC_CNT 个字节码文件"
-$LLVM_LINK -o project_all.bc $(cat bc_files.list)
-$LLVM_DIS project_all.bc -o project_all.ll
-
-echo -e "\n============================================="
-echo "🎉 测试通过！全部完成（安全无损版）"
-echo "📦 完整项目字节码: $BUILD_DIR/project_all.bc"
-echo "📄 可读IR文件: $BUILD_DIR/project_all.ll"
-echo "============================================="
