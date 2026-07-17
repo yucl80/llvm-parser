@@ -1,3 +1,5 @@
+#include "callgraph_analysis.h"
+
 #include "WPA/Andersen.h"
 #include "WPA/FlowSensitive.h"
 #include "WPA/VersionedFlowSensitive.h"
@@ -12,14 +14,6 @@
 #include <map>
 
 using namespace SVF;
-
-/// Configuration for the pointer analysis.
-struct AnalysisConfig {
-    bool useFlowSensitive = false;
-    bool useVersionedFS = false;
-    bool contextSensitive = false;
-    bool heapModel = false;
-};
 
 /// Demangle a C++ function name for human-readable output.
 static std::string demangleFuncName(const std::string& mangled) {
