@@ -1,11 +1,14 @@
 // Complex test case for call graph analysis
-// Covers: function pointers, virtual inheritance, lambdas, modern C++ dispatch patterns
+// Covers: function pointers, virtual inheritance, lambdas, modern C++ dispatch patterns,
+//         complex struct pointer passing, and C++ syntactic sugar expansion
 
 #include <cstdio>
 #include <functional>
 #include <map>
 #include <variant>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 // ===== Basic functions =====
 void directCall() {
@@ -903,6 +906,420 @@ void testRecursiveLambda() {
     (void)r;
 }
 
+// ================================================================
+// 46+: Complex Struct Pointer Passing & C++ Syntactic Sugar
+// ================================================================
+
+// ===== 46. Nested struct holding a function pointer, passed by pointer =====
+typedef void (*OpFunc)(int);
+
+struct InnerOps {
+    int base;
+    OpFunc apply;    // function pointer inside nested struct
+};
+
+struct Wrapper {
+    int id;
+    InnerOps ops;    // nested struct
+    OpFunc fallback; // function pointer in the outer struct
+};
+
+void opDouble(int v) { printf("double: %d\n", v * 2); }
+void opTriple(int v) { printf("triple: %d\n", v * 3); }
+void opFallback(int v) { printf("fallback: %d\n", v); }
+
+// struct pointer passed through a function: dispatch on nested member
+void processInner(Wrapper* w, int v) {
+    w->ops.apply(v + w->ops.base);
+}
+
+// struct pointer passed through TWO function layers
+void routeToInner(Wrapper* w) {
+    processInner(w, w->id);
+    w->fallback(w->id);
+}
+
+void testNestedStructPtr() {
+    Wrapper w1 = {1, {2, opDouble}, opFallback};
+    Wrapper w2 = {3, {4, opTriple}, opFallback};
+    routeToInner(&w1);
+    routeToInner(&w2);
+}
+
+// ===== 47. Linked list of structs, each node dispatches its own handler =====
+struct TaskNode {
+    int priority;
+    TaskNode* next;
+    void (*run)(TaskNode*);   // callback receives the struct pointer itself
+};
+
+void runLow(TaskNode* t) { printf("low prio %d\n", t->priority); }
+void runHigh(TaskNode* t) { printf("high prio %d\n", t->priority); }
+
+void runQueue(TaskNode* head) {
+    // loop-carried points-to through n = n->next
+    for (TaskNode* n = head; n != nullptr; n = n->next) {
+        n->run(n);
+    }
+}
+
+void testLinkedStructList() {
+    TaskNode t1 = {1, nullptr, runLow};
+    TaskNode t2 = {2, nullptr, runHigh};
+    t1.next = &t2;
+    t2.next = nullptr;
+    runQueue(&t1);
+}
+
+// ===== 48. Binary tree recursion with per-node dispatch =====
+struct TreeNode {
+    int key;
+    TreeNode* left;
+    TreeNode* right;
+    int (*visit)(TreeNode*);
+};
+
+int visitLeaf(TreeNode* n) { printf("leaf %d\n", n->key); return n->key; }
+int visitInternal(TreeNode* n) { printf("internal %d\n", n->key); return n->key; }
+
+void walkTree(TreeNode* n) {
+    if (!n) return;
+    n->visit(n);
+    walkTree(n->left);   // recursion over struct pointers
+    walkTree(n->right);
+}
+
+void testTreeStructPtr() {
+    TreeNode leaf1 = {1, nullptr, nullptr, visitLeaf};
+    TreeNode leaf2 = {2, nullptr, nullptr, visitLeaf};
+    TreeNode root  = {0, &leaf1, &leaf2, visitInternal};
+    walkTree(&root);
+}
+
+// ===== 49. Function pointer that takes a struct pointer (callback) =====
+typedef int (*Transform)(struct Point2D*);
+struct Point2D { int x, y; };
+
+int scalePoint(Point2D* p) { printf("scale\n"); p->x *= 2; return p->x; }
+int negatePoint(Point2D* p) { printf("negate\n"); p->y = -p->y; return p->y; }
+
+void applyTransform(Point2D* p, Transform t) {
+    t(p);   // struct pointer handed to an indirect callee
+}
+
+void testStructPtrCallback() {
+    Point2D pt = {3, 4};
+    applyTransform(&pt, scalePoint);
+    applyTransform(&pt, negatePoint);
+}
+
+// ===== 50. Pointer-to-pointer-to-struct with target mutation =====
+struct Gadget {
+    void (*fire)(void);
+};
+
+void gadgetA() { printf("gadget A\n"); }
+void gadgetB() { printf("gadget B\n"); }
+
+void testDoublePtrStruct() {
+    Gadget g1 = {gadgetA};
+    Gadget g2 = {gadgetB};
+    Gadget* pg = &g1;
+    Gadget** ppg = &pg;
+
+    (*ppg)->fire();    // dispatch through double pointer
+    *ppg = &g2;        // retarget the pointer
+    (*ppg)->fire();
+}
+
+// ===== 51. Array of structs passed by pointer; self-pointer callbacks =====
+struct Slot {
+    const char* name;
+    void (*work)(Slot*);
+};
+
+void workA(Slot* s) { printf("slot A: %s\n", s->name); }
+void workB(Slot* s) { printf("slot B: %s\n", s->name); }
+
+void runSlots(Slot* slots, int count) {
+    for (int i = 0; i < count; i++) {
+        slots[i].work(&slots[i]);   // each element points to itself
+    }
+}
+
+void testStructArrayPtr() {
+    Slot slots[3] = {
+        {"a", workA},
+        {"b", workB},
+        {"c", workA},
+    };
+    runSlots(slots, 3);
+}
+
+// ===== 52. Struct field pointing to a function pointer (double indirection) =====
+// NOTE: the fn-pointers arrive via memcpy from a *global constant* array,
+// so this resolves only with --heap-model (ModelConsts), not baseline Andersen.
+struct Registry {
+    void (**slot)();
+};
+
+void regA() { printf("reg A\n"); }
+void regB() { printf("reg B\n"); }
+
+void testStructPtrToFuncPtr() {
+    void (*fns[2])() = {regA, regB};
+    Registry r = {&fns[0]};
+    (*(r.slot))();    // load fn-ptr-ptr, load fn-ptr, indirect call
+    r.slot = &fns[1];
+    (*(r.slot))();
+}
+
+// ===== 53. Setter function writing a function pointer into a struct =====
+struct Service {
+    void (*handler)(int);
+};
+
+void setHandler(Service* s, void (*h)(int)) {
+    s->handler = h;   // interprocedural store into struct field
+}
+
+void svcA(int v) { printf("svc A %d\n", v); }
+void svcB(int v) { printf("svc B %d\n", v); }
+
+void testStructPtrSetter() {
+    Service s;
+    setHandler(&s, svcA);
+    s.handler(1);
+    setHandler(&s, svcB);
+    s.handler(2);
+}
+
+// ===== 54. Range-based for over a vector of std::function (sugar) =====
+void rfA() { printf("rf A\n"); }
+void rfB() { printf("rf B\n"); }
+
+void testRangeFor() {
+    std::vector<std::function<void()>> tasks;
+    tasks.push_back(rfA);
+    tasks.push_back(rfB);
+    tasks.push_back([]() { printf("rf lambda\n"); });
+
+    // desugars to begin()/end()/operator!=/operator++/operator* + call
+    for (auto& f : tasks) {
+        f();
+    }
+}
+
+// ===== 55. Virtual dispatch through a reference parameter =====
+void speakViaRef(Animal& a) {
+    a.speak();   // references are pointer aliases in IR
+}
+
+void testVirtualRefParam() {
+    Dog dog;
+    Cat cat;
+    speakViaRef(dog);
+    speakViaRef(cat);
+}
+
+// ===== 56. dynamic_cast downcast then virtual call (RTTI sugar) =====
+void testDynamicCast() {
+    Animal* a = new Dog();
+    Dog* d = dynamic_cast<Dog*>(a);   // emits __dynamic_cast runtime helper
+    if (d) {
+        d->speak();
+    }
+    delete a;
+}
+
+// ===== 57. new[]/delete[] array allocation sugar =====
+void testArrayNewDelete() {
+    Animal** zoo = new Animal*[2];
+    zoo[0] = new Dog();
+    zoo[1] = new Cat();
+    for (int i = 0; i < 2; i++) zoo[i]->speak();
+    for (int i = 0; i < 2; i++) delete zoo[i];
+    delete[] zoo;
+}
+
+// ===== 58. Move / copy semantics (std::move sugar) =====
+struct Mover {
+    int payload;
+    Mover() : payload(0) { printf("Mover ctor\n"); }
+    Mover(const Mover& o) : payload(o.payload) { printf("Mover copy\n"); }
+    Mover(Mover&& o) noexcept : payload(o.payload) {
+        printf("Mover move\n");
+        o.payload = 0;
+    }
+};
+
+Mover makeMover() {
+    Mover m;
+    return m;   // move (copy elision disabled at -O0)
+}
+
+void testMoveSemantics() {
+    Mover a;
+    Mover b = std::move(a);   // move ctor
+    Mover c = a;              // copy ctor
+    Mover d = makeMover();    // ctor + move from return
+    (void)b; (void)c; (void)d;
+}
+
+// ===== 59. Ternary function pointer passed directly as an argument =====
+void onTrue() { printf("ternary true\n"); }
+void onFalse() { printf("ternary false\n"); }
+
+void callOnce(FuncPtr f) { f(); }
+
+void testTernaryAsArg() {
+    int flag = 1;
+    callOnce(flag ? onTrue : onFalse);   // no intermediate variable
+    flag = 0;
+    callOnce(flag ? onTrue : onFalse);
+}
+
+// ===== 60. Operator overloading sugar (operator[] / operator->) =====
+class Vector2 {
+    double data[2];
+public:
+    Vector2(double x, double y) { data[0] = x; data[1] = y; }
+    double& operator[](int i) { return data[i]; }
+};
+
+void testSubscriptOperator() {
+    Vector2 v(1.0, 2.0);
+    v[0] = v[0] * 2.0;              // reads + writes via operator[]
+    double sum = v[0] + v[1];
+    printf("sum: %f\n", sum);
+}
+
+class Counted {
+    int v;
+public:
+    Counted() : v(7) {}
+    int get() const { return v; }
+};
+
+class SmartPtr {
+    Counted* ptr;
+public:
+    SmartPtr(Counted* c) : ptr(c) {}
+    Counted* operator->() const { return ptr; }
+};
+
+void testArrowOperator() {
+    Counted c;
+    SmartPtr sp(&c);
+    int x = sp->get();   // desugars to (sp.operator->())->get()
+    printf("smart: %d\n", x);
+}
+
+// ===== 61. Magic static: guarded static local initialization =====
+int initCounter() {
+    printf("initCounter\n");
+    return 100;
+}
+
+int getCounter() {
+    static int counter = initCounter();   // __cxa_guard_acquire/release
+    return counter;
+}
+
+void testMagicStatic() {
+    int a = getCounter();
+    int b = getCounter();
+    printf("counter: %d %d\n", a, b);
+}
+
+// ===== 62. Structured bindings (C++17 sugar) =====
+void testStructuredBinding() {
+    auto pair = std::make_pair(1, 2.5);
+    auto [first, second] = pair;   // expands to std::get<0>/std::get<1>
+    printf("sb: %d %.1f\n", first, second);
+}
+
+// ===== 63. Delegating constructor =====
+class Deleg {
+public:
+    Deleg() : Deleg(0, 0) { printf("Deleg default\n"); }
+    Deleg(int a, int b) { printf("Deleg(%d,%d)\n", a, b); }
+};
+
+void testDelegatingCtor() {
+    Deleg d;   // Deleg() -> Deleg(int,int)
+}
+
+// ===== 64. Static member functions + pointer to static member =====
+struct Utility {
+    static void boot() { printf("Utility::boot\n"); }
+    static void halt() { printf("Utility::halt\n"); }
+};
+
+void testStaticMemberFuncPtr() {
+    Utility::boot();                 // direct static call
+    void (*sf)() = &Utility::halt;   // pointer to static member
+    sf();
+
+    typedef void (*StaticFn)();
+    StaticFn table[2] = {Utility::boot, Utility::halt};
+    table[0]();
+    table[1]();
+}
+
+// ===== 65. Abstract factory returning a base pointer (return-value pts) =====
+Animal* makeAnimal(int kind) {
+    if (kind == 0) return new Dog();
+    return new Cat();
+}
+
+void testFactoryPattern() {
+    Animal* a = makeAnimal(0);
+    Animal* b = makeAnimal(1);
+    a->speak();   // virtual call resolved from factory return value
+    b->speak();
+    delete a;
+    delete b;
+}
+
+// ===== 66. extern "C" linkage and anonymous namespace =====
+extern "C" void cLinkageFunc() {
+    printf("extern C\n");
+}
+
+namespace {
+void hiddenHelper() {
+    printf("anon ns helper\n");
+}
+void hiddenEntry() {
+    hiddenHelper();
+}
+}
+
+void testLinkageVariants() {
+    cLinkageFunc();
+    hiddenEntry();
+}
+
+// ===== 67. Pointer to virtual member function (a->*sf) =====
+// NOTE: the target address is computed from the vtable index, so SVF
+// generally cannot resolve this indirect call (exercises the hard case).
+void testVirtualMemberPtr() {
+    Animal* a = new Dog();
+    typedef void (Animal::*SpeakFn)();
+    SpeakFn sf = &Animal::speak;
+    (a->*sf)();   // vtable-index call via pointer-to-member
+    delete a;
+}
+
+// ===== 68. constexpr function invoked in runtime context =====
+constexpr int square(int x) { return x * x; }
+
+void testConstexprRuntime(int runtimeInput) {
+    int n = square(runtimeInput);   // non-constant argument => real call
+    printf("square: %d\n", n);
+}
+
 // ===== Main =====
 int main() {
     directCall();
@@ -952,5 +1369,33 @@ int main() {
     testOverloadedLambda();
     testVariantVisit();
     testRecursiveLambda();
+
+    // Complex struct pointer passing
+    testNestedStructPtr();
+    testLinkedStructList();
+    testTreeStructPtr();
+    testStructPtrCallback();
+    testDoublePtrStruct();
+    testStructArrayPtr();
+    testStructPtrToFuncPtr();
+    testStructPtrSetter();
+
+    // C++ syntactic sugar
+    testRangeFor();
+    testVirtualRefParam();
+    testDynamicCast();
+    testArrayNewDelete();
+    testMoveSemantics();
+    testTernaryAsArg();
+    testSubscriptOperator();
+    testArrowOperator();
+    testMagicStatic();
+    testStructuredBinding();
+    testDelegatingCtor();
+    testStaticMemberFuncPtr();
+    testFactoryPattern();
+    testLinkageVariants();
+    testVirtualMemberPtr();
+    testConstexprRuntime(5);
     return 0;
 }
