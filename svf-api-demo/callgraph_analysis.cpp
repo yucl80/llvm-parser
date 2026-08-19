@@ -8,7 +8,10 @@
 #include "SVF-LLVM/SVFIRBuilder.h"
 #include "Util/Options.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Instructions.h"
 
+#include <algorithm>
 #include <vector>
 #include <set>
 #include <map>
@@ -21,11 +24,68 @@ static std::string demangleFuncName(const std::string& mangled) {
     return result.empty() ? mangled : result;
 }
 
+/// Source line range of a function definition, extracted from debug info.
+struct FuncLineRange {
+    std::string file;
+    unsigned start = 0;
+    unsigned end = 0;
+    bool hasInfo = false;
+};
+
+/// Compute a function's definition line range from its DISubprogram.
+/// The start line is the function signature line; the end line is the
+/// largest debug line among the function's own (non-inlined) instructions.
+/// Returns false when the bitcode has no debug info (not built with -g).
+static bool getFuncLineRange(const llvm::Function* F, FuncLineRange& range) {
+    const llvm::DISubprogram* sp = F->getSubprogram();
+    if (!sp) return false;
+
+    range.file = sp->getFilename().str();
+    range.start = sp->getLine();
+    range.end = range.start;
+
+    for (const llvm::BasicBlock& bb : *F) {
+        for (const llvm::Instruction& inst : bb) {
+            const llvm::DILocation* loc = inst.getDebugLoc();
+            if (!loc || loc->getInlinedAt()) continue; // skip inlined callee code
+            range.end = std::max(range.end, loc->getLine());
+        }
+    }
+    range.hasInfo = true;
+    return true;
+}
+
+/// Collect the source line numbers of the call site(s) backing an edge.
+/// Each call site is an LLVM call instruction, recovered from the edge's
+/// CallICFGNode via LLVMModuleSet's reverse value map. The outermost debug
+/// location is used so inlined call text still reports the caller's line.
+static std::vector<unsigned> getCallSiteLines(const CallGraphEdge* edge) {
+    std::set<unsigned> lines;
+    LLVMModuleSet* modSet = LLVMModuleSet::getLLVMModuleSet();
+    auto collect = [&](CallGraphEdge::CallInstSet::const_iterator begin,
+                       CallGraphEdge::CallInstSet::const_iterator end) {
+        for (auto it = begin; it != end; ++it) {
+            if (!modSet->hasLLVMValue(*it)) continue;
+            const auto* call = llvm::dyn_cast_or_null<const llvm::CallBase>(
+                modSet->getLLVMValue(*it));
+            const llvm::DILocation* loc = call ? call->getDebugLoc() : nullptr;
+            if (!loc) continue;
+            while (loc->getInlinedAt()) loc = loc->getInlinedAt();
+            lines.insert(loc->getLine());
+        }
+    };
+    collect(edge->directCallsBegin(), edge->directCallsEnd());
+    collect(edge->indirectCallsBegin(), edge->indirectCallsEnd());
+    return std::vector<unsigned>(lines.begin(), lines.end());
+}
+
 /// Print the call graph as a topological tree from the given node.
 static void printCallTree(CallGraphNode* node,
                           const std::string& prefix,
                           bool is_last,
-                          std::set<CallGraphNode*>& in_stack) {
+                          std::set<CallGraphNode*>& in_stack,
+                          const std::map<std::string, FuncLineRange>& lineRanges,
+                          const std::vector<unsigned>& callLines) {
     if (!node) return;
 
     const FunObjVar* func = node->getFunction();
@@ -35,7 +95,21 @@ static void printCallTree(CallGraphNode* node,
         llvm::outs() << prefix;
         llvm::outs() << (is_last ? "└── " : "├── ");
     }
-    llvm::outs() << demangleFuncName(func->getName()) << "\n";
+    llvm::outs() << demangleFuncName(func->getName());
+    auto it = lineRanges.find(func->getName());
+    if (it != lineRanges.end() && it->second.hasInfo) {
+        llvm::outs() << "  [" << it->second.file << ":"
+                     << it->second.start << "-" << it->second.end << "]";
+    }
+    if (!callLines.empty()) {
+        llvm::outs() << "  [call@";
+        for (size_t i = 0; i < callLines.size(); ++i) {
+            if (i) llvm::outs() << ",";
+            llvm::outs() << callLines[i];
+        }
+        llvm::outs() << "]";
+    }
+    llvm::outs() << "\n";
 
     std::vector<CallGraphEdge*> edges;
     for (auto it = node->OutEdgeBegin(); it != node->OutEdgeEnd(); ++it)
@@ -57,6 +131,8 @@ static void printCallTree(CallGraphNode* node,
         CallGraphNode* callee = edges[i]->getDstNode();
         if (!callee->getFunction()) continue;
 
+        std::vector<unsigned> callLines = getCallSiteLines(edges[i]);
+
         bool indirect = edges[i]->isIndirectCallEdge();
         if (indirect) {
             llvm::outs() << child_prefix;
@@ -64,9 +140,9 @@ static void printCallTree(CallGraphNode* node,
             llvm::outs() << "[Indirect]\n";
             printCallTree(callee,
                           child_prefix + (child_is_last ? "    " : "│   "),
-                          true, in_stack);
+                          true, in_stack, lineRanges, callLines);
         } else {
-            printCallTree(callee, child_prefix, child_is_last, in_stack);
+            printCallTree(callee, child_prefix, child_is_last, in_stack, lineRanges, callLines);
         }
     }
     in_stack.erase(node);
@@ -115,6 +191,14 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
     // 4. Get the CallGraph and print topology
     CallGraph* callGraph = pta->getCallGraph();
 
+    // Map mangled function name -> definition line range (from debug info).
+    std::map<std::string, FuncLineRange> lineRanges;
+    for (llvm::Function& F : M) {
+        FuncLineRange range;
+        if (getFuncLineRange(&F, range))
+            lineRanges[F.getName().str()] = range;
+    }
+
     // Print header with mode info
     llvm::outs() << "===== Call Graph Topology ";
     if (config.useFlowSensitive)
@@ -138,7 +222,8 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
         if (name != "main") continue;
 
         std::set<CallGraphNode*> in_stack;
-        printCallTree(node, "", true, in_stack);
+        std::vector<unsigned> rootCallLines;  // root has no incoming call site
+        printCallTree(node, "", true, in_stack, lineRanges, rootCallLines);
     }
 
     // 5. Cleanup
