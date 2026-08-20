@@ -1,15 +1,16 @@
-{ 
+{
   "permissions": {
     "allow": [
       "Bash(ls:*)",
       "Bash(llvm-config-21:*)",
-      "Bash(g++:*)",
-      "Bash(/root/src/SVF/llvm-21.1.0.obj/bin/clang:*)",
-      "Bash(/root/src/SVF/llvm-21.1.0.obj/bin/clang++:*)",
-      "Bash(LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib ./test_svf:*)",
-      "Read(//root/src/SVF/llvm-21.1.0.obj/bin/**)",
-      "Read(//root/src/SVF/Release-build/lib/**)",
-      "Bash(./test_complex *)"
+      "Bash(cmake:*)",
+      "Bash(make:*)",
+      "Bash(/usr/lib/llvm-21/bin/clang:*)",
+      "Bash(/usr/lib/llvm-21/bin/clang++:*)",
+      "Bash(LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib ./svf-api-demo/build/test_svf:*)",
+      "Read(//usr/lib/llvm-21/bin/**)",
+      "Read(//home/test/src/SVF/Release-build/lib/**)",
+      "Bash(./svf-api-demo/build/test_complex *)"
     ]
   }
 }
