@@ -7,10 +7,12 @@
 #include <vector>
 
 /// Configuration for the pointer analysis.
+/// Defaults are tuned for the most complete + precise call graphs:
+/// flow-sensitive + context-sensitive SVFG; heap-object model is opt-in.
 struct AnalysisConfig {
-    bool useFlowSensitive = false;
+    bool useFlowSensitive = true;
     bool useVersionedFS = false;
-    bool contextSensitive = false;
+    bool contextSensitive = true;
     bool heapModel = false;
 
     /// Call-graph entry functions (demangled or mangled names).

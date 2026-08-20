@@ -17,10 +17,20 @@ struct AnalysisConfig;
 void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config);
 
 /// Configuration for analysis modes, parsed from CLI flags.
+///
+/// Defaults are tuned for the most complete + precise call graphs:
+///   * flow-sensitive PTA        -- refines points-to sets at each program point
+///                                  (measured: pure precision win, no callees lost)
+///   * context-sensitive SVFG    -- SVF's SVFG is context-sensitive by default
+///   * heap-object model OFF     -- ModelArrays resolves local fn-ptr arrays
+///                                  (e.g. `{regA, regB}`) but measurably
+///                                  under-resolves virtual dispatch through
+///                                  base-class arrays and struct dispatch tables,
+///                                  a net completeness loss; kept opt-in
 struct AnalysisConfig {
-    bool useFlowSensitive = false;
+    bool useFlowSensitive = true;
     bool useVersionedFS = false;
-    bool contextSensitive = false;
+    bool contextSensitive = true;
     bool heapModel = false;
 
     /// Call-graph entry functions (demangled or mangled names).
@@ -34,14 +44,19 @@ struct AnalysisConfig {
 static void printUsage(const char* prog) {
     llvm::errs() << "Usage: " << prog << " [options] <bitcode-file>\n"
                  << "Options:\n"
-                 << "  --fs               Use flow-sensitive analysis (FSSPARSE_WPA)\n"
+                 << "  (default)          Flow-sensitive + context-sensitive\n"
+                 << "                     (most complete & precise call graph)\n"
+                 << "  --fs               Use flow-sensitive analysis (FSSPARSE_WPA) [default on]\n"
                  << "  --vfs              Use versioned flow-sensitive analysis (VFS_WPA)\n"
-                 << "  --cs               Enable context sensitivity\n"
-                 << "  --heap-model       Enable heap object model (LocMem + ModelConsts + ModelArrays)\n"
+                 << "  --ander            Downgrade to flow-insensitive AndersenWaveDiff\n"
+                 << "  --cs               Context sensitivity [default on; SVF SVFG is\n"
+                 << "                     context-sensitive by default]\n"
+                 << "  --heap-model       Heap object model (ModelConsts + ModelArrays)\n"
+                 << "                     [opt-in; resolves local fn-ptr arrays but can\n"
+                 << "                      under-resolve virtual/struct dispatch]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
-                 << "  --output <file>    Write JSON report to <file> (default <bitcode>.callgraph.json)\n"
-                 << "  (default)          Use AndersenWaveDiff (flow/context-insensitive)\n";
+                 << "  --output <file>    Write JSON report to <file> (default <bitcode>.callgraph.json)\n";
 }
 
 static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
@@ -51,12 +66,20 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--fs") == 0) {
             config.useFlowSensitive = true;
+            config.useVersionedFS = false;
         } else if (strcmp(argv[i], "--vfs") == 0) {
             config.useVersionedFS = true;
+            config.useFlowSensitive = false;
+        } else if (strcmp(argv[i], "--ander") == 0) {
+            // Downgrade to flow-insensitive AndersenWaveDiff (faster, less precise).
+            config.useFlowSensitive = false;
+            config.useVersionedFS = false;
         } else if (strcmp(argv[i], "--cs") == 0) {
             config.contextSensitive = true;
         } else if (strcmp(argv[i], "--heap-model") == 0) {
             config.heapModel = true;
+        } else if (strcmp(argv[i], "--no-heap-model") == 0) {
+            config.heapModel = false;
         } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
             config.entries.push_back(argv[++i]);
         } else if (strcmp(argv[i], "--entry-file") == 0 && i + 1 < argc) {

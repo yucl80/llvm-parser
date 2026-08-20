@@ -338,9 +338,13 @@ static std::string defaultOutputPath(const llvm::Module& M) {
 }
 
 void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
-    if (config.contextSensitive) {
-        llvm::errs() << "[Config] Context-sensitive SVFG enabled\n";
-    }
+    const char* ptaName = config.useFlowSensitive ? "FlowSensitive"
+                        : config.useVersionedFS ? "VersionedFlowSensitive"
+                        : "AndersenWaveDiff";
+    llvm::errs() << "[Config] pta=" << ptaName
+                 << " context_sensitive=" << (config.contextSensitive ? "true" : "false")
+                 << " heap_model=" << (config.heapModel ? "true" : "false") << "\n";
+
     if (config.heapModel) {
         Options::ModelConsts.setValue(true);
         Options::ModelArrays.setValue(true);

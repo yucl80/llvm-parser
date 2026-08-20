@@ -138,28 +138,37 @@ g++ test.o a.o -o test_svf \
 
 ### Run Analysis
 
-The analyzer supports multiple analysis modes via CLI flags:
+The analyzer supports multiple analysis modes via CLI flags. The default
+is tuned for the most **complete + precise** call graph: flow-sensitive
+PTA + context-sensitive SVFG (heap-object model off). Enabling the heap
+model resolves indirect calls through **local fn-ptr arrays** (e.g.
+`void (*fns[2])() = {regA, regB}`) that the default misses, but it also
+measurably under-resolves virtual dispatch through base-class arrays and
+struct dispatch tables — a net completeness loss on the test suite — so it
+is opt-in.
 
 | Flag | Description |
 |------|-------------|
-| *(default)* | AndersenWaveDiff — flow-insensitive, context-insensitive |
-| `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis |
+| *(default)* | FlowSensitive + context-sensitive SVFG — most complete & precise |
+| `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis [default on] |
 | `--vfs` | VersionedFlowSensitive (VFS_WPA) — versioned flow-sensitive |
-| `--cs` | Context-sensitive SVFG (default is already context-sensitive) |
-| `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) |
+| `--ander` | Downgrade to flow-insensitive AndersenWaveDiff |
+| `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
+| `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
 
 ```bash
-# Default: flow-insensitive, context-insensitive
+# Default: flow-sensitive + context-sensitive (most complete & precise)
 LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
   ./test_svf test_complex.bc
 
-# Flow-sensitive
+# Flow-insensitive Andersen (faster, less precise)
 LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
-  ./test_svf --fs test_complex.bc
+  ./test_svf --ander test_complex.bc
 
-# Flow-sensitive + context-sensitive SVFG + heap object model
+# Also resolve indirect calls through local fn-ptr arrays (may lose
+# virtual/struct dispatch targets)
 LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
-  ./test_svf --fs --cs --heap-model test_complex.bc
+  ./test_svf --heap-model test_complex.bc
 
 # Versioned flow-sensitive (object versioning)
 LD_LIBRARY_PATH=/root/src/SVF/Release-build/lib:/root/src/SVF/llvm-21.1.0.obj/lib \
