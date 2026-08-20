@@ -142,14 +142,22 @@ measurably under-resolves virtual dispatch through base-class arrays and
 struct dispatch tables — a net completeness loss on the test suite — so it
 is opt-in.
 
+The output call graph **excludes C++ standard library functions** by
+default (`std::`, `__gnu_cxx::`, `__cxa_*` exception ABI, `operator
+new/delete`) to keep the tree focused on user code. Callbacks invoked from
+inside std functions (comparators, lambdas, functors) are still shown,
+grafted onto the caller that reached them. Pass `--include-stdlib` to keep
+the std functions in the output.
+
 | Flag | Description |
 |------|-------------|
-| *(default)* | FlowSensitive + context-sensitive SVFG — most complete & precise |
+| *(default)* | FlowSensitive + context-sensitive SVFG, std excluded — most complete & precise |
 | `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis [default on] |
 | `--vfs` | VersionedFlowSensitive (VFS_WPA) — versioned flow-sensitive |
 | `--ander` | Downgrade to flow-insensitive AndersenWaveDiff |
 | `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
 | `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
+| `--include-stdlib` | Keep C++ standard library functions in the call graph [default: excluded] |
 
 ```bash
 # Default: flow-sensitive + context-sensitive (most complete & precise)

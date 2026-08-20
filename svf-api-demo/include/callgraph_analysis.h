@@ -8,12 +8,18 @@
 
 /// Configuration for the pointer analysis.
 /// Defaults are tuned for the most complete + precise call graphs:
-/// flow-sensitive + context-sensitive SVFG; heap-object model is opt-in.
+/// flow-sensitive + context-sensitive SVFG; heap-object model is opt-in;
+/// C++ standard-library functions are excluded from the output.
 struct AnalysisConfig {
     bool useFlowSensitive = true;
     bool useVersionedFS = false;
     bool contextSensitive = true;
     bool heapModel = false;
+    /// Hide C++ standard library / runtime functions (std::, __gnu_cxx::,
+    /// __cxa_* exception ABI, operator new/delete) from the output call graph.
+    /// User callbacks invoked from inside std functions (comparators, lambdas,
+    /// functors) are still shown, grafted onto the caller that reached them.
+    bool excludeStd = true;
 
     /// Call-graph entry functions (demangled or mangled names).
     /// Empty => default entry "main".

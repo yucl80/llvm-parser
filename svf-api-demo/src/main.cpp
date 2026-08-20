@@ -1,3 +1,5 @@
+#include "callgraph_analysis.h"
+
 #include "WPA/Andersen.h"
 #include "Graphs/CallGraph.h"
 #include "SVF-LLVM/LLVMModule.h"
@@ -13,34 +15,6 @@
 
 using namespace SVF;
 
-struct AnalysisConfig;
-void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config);
-
-/// Configuration for analysis modes, parsed from CLI flags.
-///
-/// Defaults are tuned for the most complete + precise call graphs:
-///   * flow-sensitive PTA        -- refines points-to sets at each program point
-///                                  (measured: pure precision win, no callees lost)
-///   * context-sensitive SVFG    -- SVF's SVFG is context-sensitive by default
-///   * heap-object model OFF     -- ModelArrays resolves local fn-ptr arrays
-///                                  (e.g. `{regA, regB}`) but measurably
-///                                  under-resolves virtual dispatch through
-///                                  base-class arrays and struct dispatch tables,
-///                                  a net completeness loss; kept opt-in
-struct AnalysisConfig {
-    bool useFlowSensitive = true;
-    bool useVersionedFS = false;
-    bool contextSensitive = true;
-    bool heapModel = false;
-
-    /// Call-graph entry functions (demangled or mangled names).
-    /// Empty => default entry "main".
-    std::vector<std::string> entries;
-
-    /// Output file path; empty => "<bitcode-stem>.callgraph.json".
-    std::string outputFile;
-};
-
 static void printUsage(const char* prog) {
     llvm::errs() << "Usage: " << prog << " [options] <bitcode-file>\n"
                  << "Options:\n"
@@ -54,6 +28,9 @@ static void printUsage(const char* prog) {
                  << "  --heap-model       Heap object model (ModelConsts + ModelArrays)\n"
                  << "                     [opt-in; resolves local fn-ptr arrays but can\n"
                  << "                      under-resolve virtual/struct dispatch]\n"
+                 << "  --include-stdlib   Include C++ standard library functions\n"
+                 << "                     (std::, __gnu_cxx::, C++ runtime ABI) in the\n"
+                 << "                     call graph [default: excluded]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
                  << "  --output <file>    Write JSON report to <file> (default <bitcode>.callgraph.json)\n";
@@ -80,6 +57,8 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
             config.heapModel = true;
         } else if (strcmp(argv[i], "--no-heap-model") == 0) {
             config.heapModel = false;
+        } else if (strcmp(argv[i], "--include-stdlib") == 0) {
+            config.excludeStd = false;
         } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
             config.entries.push_back(argv[++i]);
         } else if (strcmp(argv[i], "--entry-file") == 0 && i + 1 < argc) {

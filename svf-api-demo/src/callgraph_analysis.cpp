@@ -36,6 +36,23 @@ static std::string stripParams(std::string s) {
     return s;
 }
 
+/// True for C++ standard library / runtime functions hidden from the output
+/// call graph by default: the std:: and __gnu_cxx:: namespaces, the __cxa_*
+/// exception ABI, the allocation operators, and clang's terminate helper.
+/// User callbacks called from inside these (comparators, lambdas, functors)
+/// are still shown, grafted onto the caller that reached them.
+static bool isStdLibFunction(const std::string& demangled) {
+    if (demangled.rfind("std::", 0) == 0) return true;
+    if (demangled.rfind("__gnu_cxx::", 0) == 0) return true;
+    if (demangled.rfind("__cxa_", 0) == 0) return true;
+    if (demangled == "__clang_call_terminate") return true;
+    // operator new/delete carry parameter lists ("operator new(unsigned long)");
+    // strip them before the exact-name match.
+    const std::string base = stripParams(demangled);
+    return base == "operator new" || base == "operator new[]" ||
+           base == "operator delete" || base == "operator delete[]";
+}
+
 /// Source line range of a function definition, extracted from debug info.
 struct FuncLineRange {
     std::string file;
@@ -111,6 +128,12 @@ struct Span {
 /// Recursively emit spans for the call graph rooted at \p node, mirroring the
 /// tree traversal (one span per call edge, cycle-cut). \p reachable collects
 /// the set of unique function names reachable from the entry.
+///
+/// When \p excludeStd is set, standard-library nodes produce no span: their
+/// user-code children are grafted onto the nearest non-std ancestor (the
+/// parent span / depth pass through unchanged), so callbacks invoked from
+/// inside std functions still appear. Std nodes still join \p in_stack so
+/// recursion through std machinery is cycle-cut.
 static void emitSpans(CallGraphNode* node,
                       unsigned depth,
                       const std::optional<unsigned>& parentSpanId,
@@ -119,26 +142,37 @@ static void emitSpans(CallGraphNode* node,
                       std::set<CallGraphNode*>& in_stack,
                       const std::map<std::string, FuncLineRange>& lineRanges,
                       std::vector<Span>& spans,
-                      std::set<std::string>& reachable) {
+                      std::set<std::string>& reachable,
+                      bool excludeStd) {
     const FunObjVar* func = node->getFunction();
     if (!func || in_stack.count(node)) return;
 
-    Span s;
-    s.span_id = spans.size();
-    s.parent_span_id = parentSpanId;
-    s.function = stripParams(demangleFuncName(func->getName()));
-    s.mangled = func->getName();
-    auto lit = lineRanges.find(func->getName());
-    if (lit != lineRanges.end() && lit->second.hasInfo) {
-        s.file = lit->second.file;
-        s.start_line = lit->second.start;
-        s.end_line = lit->second.end;
+    const std::string mangled = func->getName();
+    const std::string demangled = demangleFuncName(mangled);
+    const bool isStd = excludeStd && isStdLibFunction(demangled);
+
+    // Std-library nodes are skipped in the output; their user-code children
+    // are grafted onto the nearest non-std ancestor (parentSpanId unchanged).
+    std::optional<unsigned> mySpanId;
+    if (!isStd) {
+        Span s;
+        s.span_id = spans.size();
+        s.parent_span_id = parentSpanId;
+        s.function = stripParams(demangled);
+        s.mangled = mangled;
+        auto lit = lineRanges.find(mangled);
+        if (lit != lineRanges.end() && lit->second.hasInfo) {
+            s.file = lit->second.file;
+            s.start_line = lit->second.start;
+            s.end_line = lit->second.end;
+        }
+        s.call_line = callLine;
+        s.kind = kind;
+        s.depth = depth;
+        spans.push_back(s);
+        reachable.insert(mangled);
+        mySpanId = s.span_id;
     }
-    s.call_line = callLine;
-    s.kind = kind;
-    s.depth = depth;
-    spans.push_back(s);
-    reachable.insert(func->getName());
 
     std::vector<CallGraphEdge*> edges;
     for (auto it = node->OutEdgeBegin(); it != node->OutEdgeEnd(); ++it)
@@ -146,6 +180,10 @@ static void emitSpans(CallGraphNode* node,
     if (edges.empty()) return;
 
     in_stack.insert(node);
+
+    // Depth / parent for the next emitted node: bump only past emitted nodes.
+    const std::optional<unsigned> childParent = isStd ? parentSpanId : mySpanId;
+    const unsigned childDepth = isStd ? depth : depth + 1;
 
     for (CallGraphEdge* edge : edges) {
         CallGraphNode* callee = edge->getDstNode();
@@ -160,12 +198,15 @@ static void emitSpans(CallGraphNode* node,
 
         if (in_stack.count(callee)) {
             // Cycle back-edge: record the span but do not expand its subtree.
+            const std::string cm = callee->getFunction()->getName();
+            if (excludeStd && isStdLibFunction(demangleFuncName(cm)))
+                continue;  // std nodes are not part of the output
             Span cs;
             cs.span_id = spans.size();
-            cs.parent_span_id = s.span_id;
-            cs.function = stripParams(demangleFuncName(callee->getFunction()->getName()));
-            cs.mangled = callee->getFunction()->getName();
-            auto cit = lineRanges.find(callee->getFunction()->getName());
+            cs.parent_span_id = childParent;
+            cs.function = stripParams(demangleFuncName(cm));
+            cs.mangled = cm;
+            auto cit = lineRanges.find(cm);
             if (cit != lineRanges.end() && cit->second.hasInfo) {
                 cs.file = cit->second.file;
                 cs.start_line = cit->second.start;
@@ -173,15 +214,15 @@ static void emitSpans(CallGraphNode* node,
             }
             cs.call_line = cl;
             cs.kind = childKind;
-            cs.depth = depth + 1;
+            cs.depth = childDepth;
             cs.cycle = true;
             spans.push_back(cs);
-            reachable.insert(callee->getFunction()->getName());
+            reachable.insert(cm);
             continue;
         }
 
-        emitSpans(callee, depth + 1, s.span_id, childKind, cl,
-                  in_stack, lineRanges, spans, reachable);
+        emitSpans(callee, childDepth, childParent, childKind, cl,
+                  in_stack, lineRanges, spans, reachable, excludeStd);
     }
     in_stack.erase(node);
 }
@@ -266,7 +307,8 @@ static void writeReportJson(std::ostream& os,
     else
         os << "AndersenWaveDiff";
     os << "\", \"context_sensitive\": " << (config.contextSensitive ? "true" : "false")
-       << ", \"heap_model\": " << (config.heapModel ? "true" : "false") << " },\n";
+       << ", \"heap_model\": " << (config.heapModel ? "true" : "false")
+       << ", \"exclude_std\": " << (config.excludeStd ? "true" : "false") << " },\n";
 
     // Entries.
     os << "  \"entries\": [";
@@ -343,7 +385,8 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
                         : "AndersenWaveDiff";
     llvm::errs() << "[Config] pta=" << ptaName
                  << " context_sensitive=" << (config.contextSensitive ? "true" : "false")
-                 << " heap_model=" << (config.heapModel ? "true" : "false") << "\n";
+                 << " heap_model=" << (config.heapModel ? "true" : "false")
+                 << " exclude_std=" << (config.excludeStd ? "true" : "false") << "\n";
 
     if (config.heapModel) {
         Options::ModelConsts.setValue(true);
@@ -401,7 +444,7 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
         std::set<std::string> reachable;
         std::vector<Span> spans;
         emitSpans(entryNode, 0, std::nullopt, "root", std::nullopt,
-                  in_stack, lineRanges, spans, reachable);
+                  in_stack, lineRanges, spans, reachable, config.excludeStd);
         entrySpans[name] = std::move(spans);
         reachableCounts[name] = reachable.size();
     }
