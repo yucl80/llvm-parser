@@ -171,11 +171,48 @@ LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib \
 ```
 
 Convenience target — build and run the analyzer on the test-complex bitcode
-with the default config (sets `LD_LIBRARY_PATH` itself):
+with the default config. The bundled runtime libs in `build/lib/` are picked
+up via the `$ORIGIN` rpath, so no `LD_LIBRARY_PATH` is needed:
 
 ```bash
 cmake --build svf-api-demo/build --target analyze
 ```
+
+### Deploy to Another Machine
+
+`test_svf` links against shared SVF/LLVM/z3 libraries and carries an
+`$ORIGIN`-relative rpath, so the runtime libraries travel with the binary.
+Build a self-contained deployment folder:
+
+```bash
+cmake --build svf-api-demo/build --target deploy
+```
+
+This assembles `svf-api-demo/build/deploy/`:
+
+```
+deploy/
+├── test_svf
+└── lib/
+    ├── libSvfCore.so.3
+    ├── libSvfLLVM.so.3
+    ├── libLLVM.so.21.1
+    ├── libz3.so.4
+    └── extapi.bc        # SVF's external-API model (located beside libSvfCore.so)
+```
+
+Copy that folder to any x86-64 Linux machine and run — no installs, no
+`LD_LIBRARY_PATH`:
+
+```bash
+./deploy/test_svf my_program.bc
+```
+
+The target machine only needs the usual base system libraries (glibc,
+libstdc++, zlib, zstd, ICU …), which are present on essentially every Linux
+distro. Fully static linking is not possible without rebuilding SVF itself
+as a static library (it is built shared-only); the `$ORIGIN` bundle is the
+pragmatic equivalent.
 
 ### Run Test Program
 

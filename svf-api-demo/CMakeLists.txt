@@ -97,13 +97,65 @@ add_custom_target(bitcode ALL DEPENDS
     "${TEST_BITCODE_DIR}/test_prog.bc")
 
 # ---------------------------------------------------------------------------
+# Deployable runtime (self-contained; no LD_LIBRARY_PATH needed on the target)
+#
+# test_svf is linked with an $ORIGIN-relative rpath so the SVF/LLVM/z3 shared
+# libraries can live in ./lib next to the binary. Copy the whole build/deploy
+# folder to any x86-64 Linux and run -- no installs or env vars required.
+# ---------------------------------------------------------------------------
+set_target_properties(test_svf PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
+
+# Runtime SONAMEs the loader resolves (the versioned .so.3/.so.21.1 files, not
+# the dev symlinks). cmake -E copy dereferences symlinks, so copying these
+# names yields exactly the file the loader looks up at runtime.
+set(RUNTIME_LIB_DIR "${CMAKE_BINARY_DIR}/lib")
+# Exact SONAME file, not a -l style name, so find_file (not find_library).
+find_file(Z3_RUNTIME_LIB NAMES libz3.so.4 libz3.so.3
+    HINTS "/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu")
+
+# extapi.bc is SVF's external-API model bitcode; SVF locates it relative to
+# the loaded libSvfCore.so (ExtAPI.cpp item 6), so it must ship beside it.
+set(RUNTIME_LIBS
+    "${SVF_ROOT}/Release-build/lib/libSvfCore.so.3"
+    "${SVF_ROOT}/Release-build/lib/libSvfLLVM.so.3"
+    "${LLVM_PREFIX}/lib/libLLVM.so.21.1"
+    "${Z3_RUNTIME_LIB}"
+    "${SVF_ROOT}/Release-build/lib/extapi.bc")
+
+# Copy the runtime libs into <build>/lib/ next to the analyzer binary.
+set(RUNTIME_LIB_FILES)
+foreach(lib IN LISTS RUNTIME_LIBS)
+    if(NOT lib)
+        message(FATAL_ERROR "Could not locate a required runtime shared library")
+    endif()
+    get_filename_component(libname "${lib}" NAME)
+    set(out "${RUNTIME_LIB_DIR}/${libname}")
+    add_custom_command(OUTPUT "${out}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${RUNTIME_LIB_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${lib}" "${out}"
+        DEPENDS "${lib}"
+        COMMENT "Copying ${libname} for deployment")
+    list(APPEND RUNTIME_LIB_FILES "${out}")
+endforeach()
+add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
+
+# Assemble a clean self-contained deployment folder: test_svf + lib/.
+add_custom_target(deploy
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/deploy"
+    COMMAND "${CMAKE_COMMAND}" -E copy
+            "$<TARGET_FILE:test_svf>" "${CMAKE_BINARY_DIR}/deploy/test_svf"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${RUNTIME_LIB_DIR}" "${CMAKE_BINARY_DIR}/deploy/lib"
+    DEPENDS test_svf runtime-libs
+    COMMENT "Self-contained deployment ready at ${CMAKE_BINARY_DIR}/deploy")
+
+# ---------------------------------------------------------------------------
 # Convenience target: run the analyzer on the test-complex bitcode with the
 # default (flow-sensitive + context-sensitive) config.
 #   cmake --build build --target analyze
+# (BUILD_RPATH + runtime-libs make LD_LIBRARY_PATH unnecessary.)
 # ---------------------------------------------------------------------------
 add_custom_target(analyze
-    COMMAND "${CMAKE_COMMAND}" -E env
-            "LD_LIBRARY_PATH=${SVF_ROOT}/Release-build/lib:${LLVM_PREFIX}/lib"
-            "$<TARGET_FILE:test_svf>" "${TEST_BITCODE_DIR}/test_complex.bc"
-    DEPENDS test_svf bitcode
+    COMMAND "$<TARGET_FILE:test_svf>" "${TEST_BITCODE_DIR}/test_complex.bc"
+    DEPENDS test_svf bitcode runtime-libs
     COMMENT "Run test_svf on test_complex.bc (default config)")
