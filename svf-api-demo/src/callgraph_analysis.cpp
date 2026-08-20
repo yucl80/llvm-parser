@@ -53,6 +53,16 @@ static bool isStdLibFunction(const std::string& demangled) {
            base == "operator delete" || base == "operator delete[]";
 }
 
+/// True when a function's definition file lives in a system include directory
+/// (Linux: anything absolute under /usr/ — libstdc++, glibc headers, clang
+/// builtins). Relative paths are the analyzed program's own sources and are
+/// kept. Functions with no debug info (empty file) are not file-filtered.
+static bool isSystemHeaderFile(const std::string& file) {
+    if (file.empty() || file[0] != '/')
+        return false;
+    return file.rfind("/usr/", 0) == 0;
+}
+
 /// Source line range of a function definition, extracted from debug info.
 struct FuncLineRange {
     std::string file;
@@ -60,6 +70,28 @@ struct FuncLineRange {
     unsigned end = 0;
     bool hasInfo = false;
 };
+
+/// Whether a function is hidden from the output call graph: either its
+/// demangled name is a C++ standard-library / runtime symbol (std::,
+/// __gnu_cxx::, __cxa_*, operator new/delete), or its definition lives in a
+/// system include header. The name check alone is insufficient — libstdc++
+/// templates often demangle with a return-type prefix ("void std::...",
+/// "decltype(...) std::...") or even to a user-looking name, so the file
+/// location is the reliable signal.
+static bool isExcludedFunction(const std::string& mangled,
+                               const std::string& demangled,
+                               const std::map<std::string, FuncLineRange>& lineRanges) {
+    if (isStdLibFunction(demangled))
+        return true;
+    auto it = lineRanges.find(mangled);
+    if (it != lineRanges.end())
+        return isSystemHeaderFile(it->second.file);
+    // No debug info for this function: it is library/runtime code (libc,
+    // LLVM intrinsics, RTTI), not part of the analyzed program's own sources.
+    // Only exclude when the module does carry debug info elsewhere — otherwise
+    // the program was built without -g and nothing is attributable.
+    return !lineRanges.empty();
+}
 
 /// Compute a function's definition line range from its DISubprogram.
 /// The start line is the function signature line; the end line is the
@@ -149,10 +181,11 @@ static void emitSpans(CallGraphNode* node,
 
     const std::string mangled = func->getName();
     const std::string demangled = demangleFuncName(mangled);
-    const bool isStd = excludeStd && isStdLibFunction(demangled);
+    const bool isStd = excludeStd && isExcludedFunction(mangled, demangled, lineRanges);
 
-    // Std-library nodes are skipped in the output; their user-code children
-    // are grafted onto the nearest non-std ancestor (parentSpanId unchanged).
+    // Std-library / system-header nodes are skipped in the output; their
+    // user-code children are grafted onto the nearest non-std ancestor
+    // (parentSpanId unchanged).
     std::optional<unsigned> mySpanId;
     if (!isStd) {
         Span s;
@@ -199,8 +232,8 @@ static void emitSpans(CallGraphNode* node,
         if (in_stack.count(callee)) {
             // Cycle back-edge: record the span but do not expand its subtree.
             const std::string cm = callee->getFunction()->getName();
-            if (excludeStd && isStdLibFunction(demangleFuncName(cm)))
-                continue;  // std nodes are not part of the output
+            if (excludeStd && isExcludedFunction(cm, demangleFuncName(cm), lineRanges))
+                continue;  // std / system-header nodes are not part of the output
             Span cs;
             cs.span_id = spans.size();
             cs.parent_span_id = childParent;

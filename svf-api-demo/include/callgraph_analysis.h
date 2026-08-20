@@ -15,10 +15,15 @@ struct AnalysisConfig {
     bool useVersionedFS = false;
     bool contextSensitive = true;
     bool heapModel = false;
-    /// Hide C++ standard library / runtime functions (std::, __gnu_cxx::,
-    /// __cxa_* exception ABI, operator new/delete) from the output call graph.
-    /// User callbacks invoked from inside std functions (comparators, lambdas,
-    /// functors) are still shown, grafted onto the caller that reached them.
+    /// Hide library code from the output call graph: C++ standard library /
+    /// runtime functions (std::, __gnu_cxx::, __cxa_* exception ABI, operator
+    /// new/delete) and any function defined in a system include header
+    /// (libstdc++/glibc templates etc., e.g. under /usr/include). Name-based
+    /// filtering alone misses many libstdc++ functions whose demangled names
+    /// carry a return-type prefix ("void std::..."), so file location is used
+    /// as the reliable signal. User callbacks invoked from inside library
+    /// functions (comparators, lambdas, functors) are still shown, grafted
+    /// onto the caller that reached them.
     bool excludeStd = true;
 
     /// Call-graph entry functions (demangled or mangled names).

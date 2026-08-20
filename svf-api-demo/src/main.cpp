@@ -28,9 +28,10 @@ static void printUsage(const char* prog) {
                  << "  --heap-model       Heap object model (ModelConsts + ModelArrays)\n"
                  << "                     [opt-in; resolves local fn-ptr arrays but can\n"
                  << "                      under-resolve virtual/struct dispatch]\n"
-                 << "  --include-stdlib   Include C++ standard library functions\n"
-                 << "                     (std::, __gnu_cxx::, C++ runtime ABI) in the\n"
-                 << "                     call graph [default: excluded]\n"
+                 << "  --include-stdlib   Include C++ standard library and system-\n"
+                 << "                     header functions (std::, __gnu_cxx::, C++\n"
+                 << "                     runtime ABI, /usr/include libstdc++ etc.)\n"
+                 << "                     in the call graph [default: excluded]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
                  << "  --output <file>    Write JSON report to <file> (default <bitcode>.callgraph.json)\n";

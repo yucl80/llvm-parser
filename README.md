@@ -142,22 +142,31 @@ measurably under-resolves virtual dispatch through base-class arrays and
 struct dispatch tables — a net completeness loss on the test suite — so it
 is opt-in.
 
-The output call graph **excludes C++ standard library functions** by
-default (`std::`, `__gnu_cxx::`, `__cxa_*` exception ABI, `operator
-new/delete`) to keep the tree focused on user code. Callbacks invoked from
-inside std functions (comparators, lambdas, functors) are still shown,
-grafted onto the caller that reached them. Pass `--include-stdlib` to keep
-the std functions in the output.
+The output call graph **excludes library code** by default to keep the tree
+focused on user code:
+- C++ standard library / runtime functions by name: `std::`, `__gnu_cxx::`,
+  `__cxa_*` exception ABI, `operator new/delete`;
+- any function defined in a **system include header** (libstdc++/glibc
+  templates under `/usr/include`, etc.) — judged by its debug-info file path,
+  which catches libstdc++ functions whose demangled names carry a return-type
+  prefix (`void std::...`, `decltype(...) std::...`) and would slip past a
+  name-only filter;
+- library/runtime functions with **no debug info** (`printf`, LLVM intrinsics,
+  `__dynamic_cast`) — when the module does carry debug info elsewhere.
+
+User callbacks invoked from inside library functions (comparators, lambdas,
+functors, `std::function` targets) are still shown, grafted onto the caller
+that reached them. Pass `--include-stdlib` to keep everything in the output.
 
 | Flag | Description |
 |------|-------------|
-| *(default)* | FlowSensitive + context-sensitive SVFG, std excluded — most complete & precise |
+| *(default)* | FlowSensitive + context-sensitive SVFG, library code excluded — most complete & precise |
 | `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis [default on] |
 | `--vfs` | VersionedFlowSensitive (VFS_WPA) — versioned flow-sensitive |
 | `--ander` | Downgrade to flow-insensitive AndersenWaveDiff |
 | `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
 | `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
-| `--include-stdlib` | Keep C++ standard library functions in the call graph [default: excluded] |
+| `--include-stdlib` | Keep C++ std / system-header / no-debug-info library functions in the call graph [default: excluded] |
 
 ```bash
 # Default: flow-sensitive + context-sensitive (most complete & precise)
