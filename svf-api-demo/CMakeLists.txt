@@ -60,10 +60,10 @@ target_link_libraries(svfanalyzer PUBLIC
     z3 pthread dl)
 
 # ---------------------------------------------------------------------------
-# Analyzer CLI driver: ./test_svf [flags] <bitcode-file>
+# Analyzer CLI driver: ./clang_analyzer [flags] <bitcode-file>
 # ---------------------------------------------------------------------------
-add_executable(test_svf src/main.cpp)
-target_link_libraries(test_svf PRIVATE svfanalyzer)
+add_executable(clang_analyzer src/main.cpp)
+target_link_libraries(clang_analyzer PRIVATE svfanalyzer)
 
 # ---------------------------------------------------------------------------
 # Native test program (builds with the default host compiler; no SVF).
@@ -99,11 +99,11 @@ add_custom_target(bitcode ALL DEPENDS
 # ---------------------------------------------------------------------------
 # Deployable runtime (self-contained; no LD_LIBRARY_PATH needed on the target)
 #
-# test_svf is linked with an $ORIGIN-relative rpath so the SVF/LLVM/z3 shared
-# libraries can live in ./lib next to the binary. Copy the whole build/deploy
-# folder to any x86-64 Linux and run -- no installs or env vars required.
+# clang_analyzer is linked with an $ORIGIN-relative rpath so the SVF/LLVM/z3
+# shared libraries can live in ./lib next to the binary. Copy the whole
+# build/deploy folder to any x86-64 Linux and run -- no installs or env vars.
 # ---------------------------------------------------------------------------
-set_target_properties(test_svf PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
+set_target_properties(clang_analyzer PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
 
 # Runtime SONAMEs the loader resolves (the versioned .so.3/.so.21.1 files, not
 # the dev symlinks). cmake -E copy dereferences symlinks, so copying these
@@ -139,14 +139,14 @@ foreach(lib IN LISTS RUNTIME_LIBS)
 endforeach()
 add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
 
-# Assemble a clean self-contained deployment folder: test_svf + lib/.
+# Assemble a clean self-contained deployment folder: clang_analyzer + lib/.
 add_custom_target(deploy
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/deploy"
     COMMAND "${CMAKE_COMMAND}" -E copy
-            "$<TARGET_FILE:test_svf>" "${CMAKE_BINARY_DIR}/deploy/test_svf"
+            "$<TARGET_FILE:clang_analyzer>" "${CMAKE_BINARY_DIR}/deploy/clang_analyzer"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${RUNTIME_LIB_DIR}" "${CMAKE_BINARY_DIR}/deploy/lib"
-    DEPENDS test_svf runtime-libs
+    DEPENDS clang_analyzer runtime-libs
     COMMENT "Self-contained deployment ready at ${CMAKE_BINARY_DIR}/deploy")
 
 # ---------------------------------------------------------------------------
@@ -156,6 +156,6 @@ add_custom_target(deploy
 # (BUILD_RPATH + runtime-libs make LD_LIBRARY_PATH unnecessary.)
 # ---------------------------------------------------------------------------
 add_custom_target(analyze
-    COMMAND "$<TARGET_FILE:test_svf>" "${TEST_BITCODE_DIR}/test_complex.bc"
-    DEPENDS test_svf bitcode runtime-libs
-    COMMENT "Run test_svf on test_complex.bc (default config)")
+    COMMAND "$<TARGET_FILE:clang_analyzer>" "${TEST_BITCODE_DIR}/test_complex.bc"
+    DEPENDS clang_analyzer bitcode runtime-libs
+    COMMENT "Run clang_analyzer on test_complex.bc (default config)")
