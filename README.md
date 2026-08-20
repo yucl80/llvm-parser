@@ -6,7 +6,8 @@ SVF-based call graph analysis tool that performs Andersen-style pointer analysis
 
 ### Analyzer
 
-- **`svf-api-demo/test.cpp`** / **`svf-api-demo/a.cpp`** — Loads LLVM bitcode, builds SVFIR (Program Assignment Graph), runs AndersenWaveDiff pointer analysis, and prints the resolved call graph as a tree topology with `├──`/`└──` branch connectors.
+- **`svf-api-demo/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and writes per-entry call graphs as JSON spans.
+- **`svf-api-demo/callgraph_analysis.cpp`** / **`.h`** — Analysis core (`analyzeCallGraph`) and `AnalysisConfig`.
 - **`svf-api-demo/test_svf`** — Compiled analyzer binary.
 
 ### Test Programs
@@ -118,19 +119,19 @@ The complex test covers the following call patterns that SVF's pointer analysis 
 ### Build Analyzer
 
 ```bash
-g++ -std=c++17 -c test.cpp -o test.o \
+g++ -std=c++17 -c main.cpp -o main.o \
   -I/root/src/SVF/svf/include \
   -I/root/src/SVF/svf-llvm/include \
   -I/root/src/SVF/Release-build/include \
   -I/root/src/SVF/llvm-21.1.0.obj/include
 
-g++ -std=c++17 -c a.cpp -o a.o \
+g++ -std=c++17 -c callgraph_analysis.cpp -o callgraph_analysis.o \
   -I/root/src/SVF/svf/include \
   -I/root/src/SVF/svf-llvm/include \
   -I/root/src/SVF/Release-build/include \
   -I/root/src/SVF/llvm-21.1.0.obj/include
 
-g++ test.o a.o -o test_svf \
+g++ main.o callgraph_analysis.o -o test_svf \
   -L/root/src/SVF/Release-build/lib -lSvfCore -lSvfLLVM \
   -L/root/src/SVF/llvm-21.1.0.obj/lib -lLLVM-21 \
   -lz3 -lpthread -ldl
