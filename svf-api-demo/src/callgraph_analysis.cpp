@@ -12,20 +12,34 @@
 #include "llvm/IR/Instructions.h"
 
 #include <algorithm>
-#include <cstdio>
+#include <charconv>
 #include <fstream>
 #include <optional>
 #include <ostream>
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 
 using namespace SVF;
 
 /// Demangle a C++ function name for human-readable output.
-static std::string demangleFuncName(const std::string& mangled) {
+///
+/// Results are memoized per mangled name: the output call graph re-visits the
+/// same function on many paths (it is a call tree), so demangling it afresh
+/// on every span is the dominant serialization cost on large projects. The
+/// cache is thread-local so the traversal can be parallelized later.
+///
+/// Returns a reference into the cache (element references survive unordered_map
+/// rehash), so a call-tree span referencing the same function does not copy the
+/// demangled string on every visit.
+static const std::string& demangleFuncName(const std::string& mangled) {
+    static thread_local std::unordered_map<std::string, std::string> cache;
+    auto it = cache.find(mangled);
+    if (it != cache.end()) return it->second;
     std::string result = llvm::demangle(mangled);
-    return result.empty() ? mangled : result;
+    if (result.empty()) result = mangled;
+    return cache.emplace(mangled, std::move(result)).first->second;
 }
 
 /// Strip a trailing parameter list: "foo(int)" -> "foo".
@@ -116,50 +130,99 @@ static bool getFuncLineRange(const llvm::Function* F, FuncLineRange& range) {
     return true;
 }
 
-/// Collect the source line numbers of the call site(s) backing an edge.
+/// Minimum source line of the call site(s) backing an edge, cached per edge.
 /// Each call site is an LLVM call instruction, recovered from the edge's
 /// CallICFGNode via LLVMModuleSet's reverse value map. The outermost debug
 /// location is used so inlined call text still reports the caller's line.
-static std::vector<unsigned> getCallSiteLines(const CallGraphEdge* edge) {
-    std::set<unsigned> lines;
-    LLVMModuleSet* modSet = LLVMModuleSet::getLLVMModuleSet();
+///
+/// Only the minimum line is needed (the caller uses front() of the previously
+/// sorted set), and an edge is re-traversed for every path that reaches it, so
+/// the result is computed once per unique edge and memoized.
+static std::optional<unsigned> getMinCallSiteLine(
+    const CallGraphEdge* edge,
+    LLVMModuleSet* modSet,
+    std::unordered_map<const CallGraphEdge*, std::optional<unsigned>>& cache) {
+    auto it = cache.find(edge);
+    if (it != cache.end()) return it->second;
+
+    std::optional<unsigned> minLine;
     auto collect = [&](CallGraphEdge::CallInstSet::const_iterator begin,
                        CallGraphEdge::CallInstSet::const_iterator end) {
-        for (auto it = begin; it != end; ++it) {
-            if (!modSet->hasLLVMValue(*it)) continue;
+        for (auto vit = begin; vit != end; ++vit) {
+            if (!modSet->hasLLVMValue(*vit)) continue;
             const auto* call = llvm::dyn_cast_or_null<const llvm::CallBase>(
-                modSet->getLLVMValue(*it));
+                modSet->getLLVMValue(*vit));
             const llvm::DILocation* loc = call ? call->getDebugLoc() : nullptr;
             if (!loc) continue;
             while (loc->getInlinedAt()) loc = loc->getInlinedAt();
-            lines.insert(loc->getLine());
+            if (!minLine || loc->getLine() < *minLine)
+                minLine = loc->getLine();
         }
     };
     collect(edge->directCallsBegin(), edge->directCallsEnd());
     collect(edge->indirectCallsBegin(), edge->indirectCallsEnd());
-    return std::vector<unsigned>(lines.begin(), lines.end());
+    cache.emplace(edge, minLine);
+    return minLine;
 }
 
-/// One invocation record in a trace, expressed like a distributed-tracing
-/// span: parent_span_id links it to the calling span; the spans array order
-/// is the pre-order (call order) traversal.
-struct Span {
-    unsigned span_id = 0;
-    std::optional<unsigned> parent_span_id;
-    std::string function;   ///< demangled name
+/// Precomputed, per-function output fields. The output is a call tree, so the
+/// same function is re-visited on many paths; everything derivable from the
+/// function — demangled name, source location, std-exclusion — is computed
+/// once per unique function and reused across all its spans.
+struct FuncInfo {
     std::string mangled;    ///< raw symbol name
+    std::string function;   ///< demangled name, params stripped
     std::string file;
-    std::optional<unsigned> start_line;
-    std::optional<unsigned> end_line;
-    std::optional<unsigned> call_line;  ///< line in the caller that made the call
-    std::string kind;       ///< root | direct | indirect
-    unsigned depth = 0;
-    bool cycle = false;     ///< recursion back-edge: subtree not expanded
+    unsigned start = 0;
+    unsigned end = 0;
+    bool hasLines = false;
+    bool isStd = false;     ///< hidden from output when excludeStd is on
 };
 
-/// Recursively emit spans for the call graph rooted at \p node, mirroring the
-/// tree traversal (one span per call edge, cycle-cut). \p reachable collects
-/// the set of unique function names reachable from the entry.
+/// Lazy per-function descriptor cache, keyed by the function's FunObjVar
+/// (unique per function; the name string is only materialized on a miss).
+using FuncInfoCache = std::unordered_map<const FunObjVar*, FuncInfo>;
+
+/// Compute (or fetch) the descriptor for a function. isStd is only filled when
+/// excludeStd is on — otherwise nothing is excluded and the flag stays false.
+static const FuncInfo& getFuncInfo(const FunObjVar* func,
+                                   bool excludeStd,
+                                   const std::map<std::string, FuncLineRange>& lineRanges,
+                                   FuncInfoCache& cache) {
+    auto it = cache.find(func);
+    if (it != cache.end()) return it->second;
+    FuncInfo info;
+    info.mangled = func->getName();
+    const std::string& demangled = demangleFuncName(info.mangled);
+    info.function = stripParams(demangled);
+    auto lit = lineRanges.find(info.mangled);
+    if (lit != lineRanges.end() && lit->second.hasInfo) {
+        info.file = lit->second.file;
+        info.start = lit->second.start;
+        info.end = lit->second.end;
+        info.hasLines = true;
+    }
+    if (excludeStd)
+        info.isStd = isExcludedFunction(info.mangled, demangled, lineRanges);
+    return cache.emplace(func, std::move(info)).first->second;
+}
+
+/// Forward declaration: writeSpanLine is defined below with the other writers.
+static void writeSpanLine(std::ostream& os,
+                          const FuncInfo& info,
+                          unsigned span_id,
+                          const std::optional<unsigned>& parent_span_id,
+                          const std::string& kind,
+                          unsigned depth,
+                          bool cycle,
+                          const std::optional<unsigned>& call_line);
+
+/// Recursively stream spans for the call graph rooted at \p node, mirroring the
+/// tree traversal (one span per call edge, cycle-cut). Each span is written to
+/// \p os immediately (one tab-separated line) so the report never has to be
+/// materialized in memory; \p spanCount is the running span-id counter.
+/// \p reachable collects the set of unique function names reachable from the
+/// entry (for the per-entry summary line).
 ///
 /// When \p excludeStd is set, standard-library nodes produce no span: their
 /// user-code children are grafted onto the nearest non-std ancestor (the
@@ -173,208 +236,175 @@ static void emitSpans(CallGraphNode* node,
                       const std::optional<unsigned>& callLine,
                       std::set<CallGraphNode*>& in_stack,
                       const std::map<std::string, FuncLineRange>& lineRanges,
-                      std::vector<Span>& spans,
-                      std::set<std::string>& reachable,
+                      LLVMModuleSet* modSet,
+                      std::unordered_map<const CallGraphEdge*, std::optional<unsigned>>& callLineCache,
+                      FuncInfoCache& infoCache,
+                      std::ostream& os,
+                      unsigned& spanCount,
+                      std::unordered_set<std::string>& reachable,
                       bool excludeStd) {
     const FunObjVar* func = node->getFunction();
     if (!func || in_stack.count(node)) return;
 
-    const std::string mangled = func->getName();
-    const std::string demangled = demangleFuncName(mangled);
-    const bool isStd = excludeStd && isExcludedFunction(mangled, demangled, lineRanges);
+    const FuncInfo& info = getFuncInfo(func, excludeStd, lineRanges, infoCache);
 
     // Std-library / system-header nodes are skipped in the output; their
     // user-code children are grafted onto the nearest non-std ancestor
     // (parentSpanId unchanged).
     std::optional<unsigned> mySpanId;
-    if (!isStd) {
-        Span s;
-        s.span_id = spans.size();
-        s.parent_span_id = parentSpanId;
-        s.function = stripParams(demangled);
-        s.mangled = mangled;
-        auto lit = lineRanges.find(mangled);
-        if (lit != lineRanges.end() && lit->second.hasInfo) {
-            s.file = lit->second.file;
-            s.start_line = lit->second.start;
-            s.end_line = lit->second.end;
-        }
-        s.call_line = callLine;
-        s.kind = kind;
-        s.depth = depth;
-        spans.push_back(s);
-        reachable.insert(mangled);
-        mySpanId = s.span_id;
+    if (!info.isStd) {
+        const unsigned sid = spanCount++;
+        writeSpanLine(os, info, sid, parentSpanId, kind, depth, false, callLine);
+        reachable.insert(info.mangled);
+        mySpanId = sid;
     }
 
-    std::vector<CallGraphEdge*> edges;
-    for (auto it = node->OutEdgeBegin(); it != node->OutEdgeEnd(); ++it)
-        edges.push_back(*it);
-    if (edges.empty()) return;
+    if (node->OutEdgeBegin() == node->OutEdgeEnd()) return;
 
     in_stack.insert(node);
 
     // Depth / parent for the next emitted node: bump only past emitted nodes.
-    const std::optional<unsigned> childParent = isStd ? parentSpanId : mySpanId;
-    const unsigned childDepth = isStd ? depth : depth + 1;
+    const std::optional<unsigned> childParent = info.isStd ? parentSpanId : mySpanId;
+    const unsigned childDepth = info.isStd ? depth : depth + 1;
 
-    for (CallGraphEdge* edge : edges) {
+    for (auto eit = node->OutEdgeBegin(); eit != node->OutEdgeEnd(); ++eit) {
+        CallGraphEdge* edge = *eit;
         CallGraphNode* callee = edge->getDstNode();
         if (!callee->getFunction()) continue;
 
         bool indirect = edge->isIndirectCallEdge();
-        std::vector<unsigned> lines = getCallSiteLines(edge);
-        std::optional<unsigned> cl = lines.empty()
-            ? std::optional<unsigned>{}
-            : std::optional<unsigned>(lines.front());
+        std::optional<unsigned> cl = getMinCallSiteLine(edge, modSet, callLineCache);
         std::string childKind = indirect ? "indirect" : "direct";
 
         if (in_stack.count(callee)) {
             // Cycle back-edge: record the span but do not expand its subtree.
-            const std::string cm = callee->getFunction()->getName();
-            if (excludeStd && isExcludedFunction(cm, demangleFuncName(cm), lineRanges))
-                continue;  // std / system-header nodes are not part of the output
-            Span cs;
-            cs.span_id = spans.size();
-            cs.parent_span_id = childParent;
-            cs.function = stripParams(demangleFuncName(cm));
-            cs.mangled = cm;
-            auto cit = lineRanges.find(cm);
-            if (cit != lineRanges.end() && cit->second.hasInfo) {
-                cs.file = cit->second.file;
-                cs.start_line = cit->second.start;
-                cs.end_line = cit->second.end;
-            }
-            cs.call_line = cl;
-            cs.kind = childKind;
-            cs.depth = childDepth;
-            cs.cycle = true;
-            spans.push_back(cs);
-            reachable.insert(cm);
+            const FuncInfo& ci = getFuncInfo(callee->getFunction(), excludeStd, lineRanges, infoCache);
+            if (ci.isStd) continue;  // std / system-header nodes are not part of the output
+            writeSpanLine(os, ci, spanCount++, childParent, childKind, childDepth, true, cl);
+            reachable.insert(ci.mangled);
             continue;
         }
 
         emitSpans(callee, childDepth, childParent, childKind, cl,
-                  in_stack, lineRanges, spans, reachable, excludeStd);
+                  in_stack, lineRanges, modSet, callLineCache, infoCache,
+                  os, spanCount, reachable, excludeStd);
     }
     in_stack.erase(node);
 }
 
-/// Escape a string for embedding in a JSON string literal.
-static std::string jsonEscape(const std::string& in) {
+/// Escape a string for embedding in a tab-separated field: the separators that
+/// would break the line (tab, newline, CR) plus the escape character itself.
+static std::string tsvEscape(const std::string& in) {
     std::string out;
     out.reserve(in.size() + 8);
-    char buf[8];
     for (unsigned char c : in) {
         switch (c) {
-            case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t";  break;
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (c < 0x20) {
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
+            default:   out += static_cast<char>(c);
         }
     }
     return out;
 }
 
-/// Write one span object.
-static void writeSpanJson(std::ostream& os, const Span& s) {
-    auto numOrNull = [&os](const std::optional<unsigned>& v) {
-        if (v) os << *v;
-        else   os << "null";
-    };
-    auto strOrNull = [&os](const std::string& v) {
-        if (v.empty()) os << "null";
-        else           os << "\"" << jsonEscape(v) << "\"";
-    };
-
-    os << "        { "
-       << "\"span_id\": " << s.span_id << ", "
-       << "\"parent_span_id\": ";
-    numOrNull(s.parent_span_id);
-    os << ", "
-       << "\"function\": \"" << jsonEscape(s.function) << "\", "
-       << "\"mangled\": \"" << jsonEscape(s.mangled) << "\", "
-       << "\"file\": ";
-    strOrNull(s.file);
-    os << ", "
-       << "\"start_line\": ";
-    numOrNull(s.start_line);
-    os << ", "
-       << "\"end_line\": ";
-    numOrNull(s.end_line);
-    os << ", "
-       << "\"call_line\": ";
-    numOrNull(s.call_line);
-    os << ", "
-       << "\"kind\": \"" << s.kind << "\", "
-       << "\"depth\": " << s.depth << ", "
-       << "\"cycle\": " << (s.cycle ? "true" : "false")
-       << " }";
+/// Append a non-negative integer without iostream formatting overhead
+/// (locale, num_put): std::to_chars is allocation- and locale-free.
+static inline void appendNum(std::string& out, unsigned v) {
+    char tmp[16];
+    std::to_chars_result r = std::to_chars(tmp, tmp + sizeof(tmp), v);
+    out.append(tmp, static_cast<size_t>(r.ptr - tmp));
 }
 
-/// Serialize the whole report: top-level metadata + one callgraph per entry.
-static void writeReportJson(std::ostream& os,
-                            const llvm::Module& M,
-                            const AnalysisConfig& config,
-                            const std::vector<std::string>& entryNames,
-                            const std::map<std::string, std::vector<Span>>& entrySpans,
-                            const std::map<std::string, size_t>& reachableCounts) {
-    os << "{\n";
+/// Append a field, escaping the tab/newline/CR/backslash separators. The
+/// common case (no specials) is a single find + append — no allocation; only
+/// fields that actually contain a special character pay the escaping loop.
+static inline void appendEscaped(std::string& out, const std::string& in) {
+    if (in.find_first_of("\\\t\n\r") == std::string::npos) {
+        out.append(in);
+        return;
+    }
+    for (char c : in) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            default:   out.push_back(c);
+        }
+    }
+}
 
-    // Metadata.
-    os << "  \"schema_version\": 1,\n";
-    os << "  \"bitcode\": \"" << jsonEscape(M.getModuleIdentifier()) << "\",\n";
-    os << "  \"analysis\": { \"pta\": \"";
+/// Write one span as a tab-separated line:
+///   span_id  parent_span_id  kind  depth  cycle  function  mangled  file
+///   start_line  end_line  call_line
+/// Empty fields mean "absent" (no parent, no debug line info).
+///
+/// The line is assembled in a reusable buffer and written in one shot: the
+/// per-span cost drops from ~11 ostream << calls (each a streambuf virtual
+/// call) to a single os.write, and fields that need no escaping skip the
+/// per-field string allocation. The thread-local buffer's capacity is reused
+/// across spans, so the allocation cost amortizes to once. The per-function
+/// strings come from the descriptor cache, so no span is ever copied.
+static void writeSpanLine(std::ostream& os,
+                          const FuncInfo& info,
+                          unsigned span_id,
+                          const std::optional<unsigned>& parent_span_id,
+                          const std::string& kind,
+                          unsigned depth,
+                          bool cycle,
+                          const std::optional<unsigned>& call_line) {
+    thread_local std::string buf;
+    buf.clear();
+    appendNum(buf, span_id);
+    buf.push_back('\t');
+    if (parent_span_id) appendNum(buf, *parent_span_id);
+    buf.push_back('\t');
+    buf.append(kind);
+    buf.push_back('\t');
+    appendNum(buf, depth);
+    buf.push_back('\t');
+    buf.push_back(cycle ? '1' : '0');
+    buf.push_back('\t');
+    appendEscaped(buf, info.function);
+    buf.push_back('\t');
+    appendEscaped(buf, info.mangled);
+    buf.push_back('\t');
+    appendEscaped(buf, info.file);
+    buf.push_back('\t');
+    if (info.hasLines) appendNum(buf, info.start);
+    buf.push_back('\t');
+    if (info.hasLines) appendNum(buf, info.end);
+    buf.push_back('\t');
+    if (call_line) appendNum(buf, *call_line);
+    buf.push_back('\n');
+    os.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+}
+
+/// Write the #-prefixed metadata header. Per-entry span lines are streamed by
+/// analyzeCallGraph during the traversal, so the report is never materialized
+/// in memory.
+static void writeHeader(std::ostream& os,
+                        const llvm::Module& M,
+                        const AnalysisConfig& config,
+                        const std::vector<std::string>& entryNames) {
+    os << "#schema_version 1\n";
+    os << "#bitcode " << tsvEscape(M.getModuleIdentifier()) << "\n";
+    os << "#analysis pta=";
     if (config.useFlowSensitive)
         os << "FlowSensitive";
     else if (config.useVersionedFS)
         os << "VersionedFlowSensitive";
     else
         os << "AndersenWaveDiff";
-    os << "\", \"context_sensitive\": " << (config.contextSensitive ? "true" : "false")
-       << ", \"heap_model\": " << (config.heapModel ? "true" : "false")
-       << ", \"exclude_std\": " << (config.excludeStd ? "true" : "false") << " },\n";
-
-    // Entries.
-    os << "  \"entries\": [";
-    for (size_t i = 0; i < entryNames.size(); ++i) {
-        if (i) os << ", ";
-        os << "\"" << jsonEscape(entryNames[i]) << "\"";
-    }
-    os << "],\n";
-
-    // Per-entry call graphs.
-    os << "  \"callgraphs\": {\n";
-    bool first = true;
-    for (const std::string& name : entryNames) {
-        auto sit = entrySpans.find(name);
-        if (sit == entrySpans.end()) continue;
-        const std::vector<Span>& spans = sit->second;
-        if (!first) os << ",\n";
-        first = false;
-        os << "    \"" << jsonEscape(name) << "\": {\n";
-        os << "      \"span_count\": " << spans.size() << ",\n";
-        auto rit = reachableCounts.find(name);
-        os << "      \"reachable_funcs\": " << (rit != reachableCounts.end() ? rit->second : 0)
-           << ",\n";
-        os << "      \"spans\": [\n";
-        for (size_t i = 0; i < spans.size(); ++i) {
-            if (i) os << ",\n";
-            writeSpanJson(os, spans[i]);
-        }
-        os << "\n      ]\n";
-        os << "    }";
-    }
-    os << "\n  }\n";
-    os << "}\n";
+    os << " context_sensitive=" << (config.contextSensitive ? 1 : 0)
+       << " heap_model=" << (config.heapModel ? 1 : 0)
+       << " exclude_std=" << (config.excludeStd ? 1 : 0) << "\n";
+    os << "#entries";
+    for (const std::string& name : entryNames)
+        os << " " << tsvEscape(name);
+    os << "\n";
 }
 
 /// Resolve an entry name (mangled, demangled, or param-stripped) to its
@@ -403,13 +433,13 @@ static CallGraphNode* resolveEntry(CallGraph* cg, const std::string& name) {
     return baseMatches.empty() ? nullptr : baseMatches.front();
 }
 
-/// Default report path: "<bitcode-stem>.callgraph.json".
+/// Default report path: "<bitcode-stem>.callgraph.tsv".
 static std::string defaultOutputPath(const llvm::Module& M) {
     std::string id = M.getModuleIdentifier();
     size_t dot = id.rfind('.');
     if (!id.empty() && dot != std::string::npos)
         id = id.substr(0, dot);
-    return (id.empty() ? "callgraph" : id) + ".callgraph.json";
+    return (id.empty() ? "callgraph" : id) + ".callgraph.tsv";
 }
 
 void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
@@ -443,7 +473,7 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
     } else if (config.useVersionedFS) {
         pta = new VersionedFlowSensitive(pag);
     } else {
-        pta = new AndersenWaveDiff(pag, Andersen::AndersenWaveDiff_WPA, false);
+        pta = new AndersenWaveDiff(pag, PTATY::AndersenWaveDiff_WPA, false);
     }
     pta->disablePrintStat();
     pta->analyze();
@@ -464,35 +494,46 @@ void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config) {
     if (entryNames.empty())
         entryNames.push_back("main");
 
-    // Emit one call graph (spans) per entry.
-    std::map<std::string, std::vector<Span>> entrySpans;
-    std::map<std::string, size_t> reachableCounts;
-    for (const std::string& name : entryNames) {
-        CallGraphNode* entryNode = resolveEntry(callGraph, name);
-        if (!entryNode) {
-            llvm::errs() << "[WARN] entry function not found: " << name << "\n";
-            continue;
-        }
-        std::set<CallGraphNode*> in_stack;
-        std::set<std::string> reachable;
-        std::vector<Span> spans;
-        emitSpans(entryNode, 0, std::nullopt, "root", std::nullopt,
-                  in_stack, lineRanges, spans, reachable, config.excludeStd);
-        entrySpans[name] = std::move(spans);
-        reachableCounts[name] = reachable.size();
-    }
-
-    // 5. Write the JSON report to a file.
+    // 5. Stream the report to a file: header, then one #entry/#end block per
+    //    resolved entry with its spans written as they are generated. Peak
+    //    memory is O(depth + unique functions + unique edges), not O(span
+    //    count), so multi-million-span trees no longer balloon. The reverse
+    //    value map and the per-edge call-line cache are shared across entries
+    //    (edges are stable objects), so call lines are extracted once.
     std::string outPath = config.outputFile.empty()
         ? defaultOutputPath(M)
         : config.outputFile;
-    std::ofstream ofs(outPath);
-    if (!ofs) {
+    static char outBuf[4 << 20];
+    std::filebuf fb;
+    fb.pubsetbuf(outBuf, sizeof(outBuf));
+    if (!fb.open(outPath.c_str(), std::ios::out)) {
         llvm::errs() << "[ERROR] cannot open output file: " << outPath << "\n";
     } else {
-        writeReportJson(ofs, M, config, entryNames, entrySpans, reachableCounts);
-        ofs.close();
-        if (ofs.good())
+        std::ostream os(&fb);
+        LLVMModuleSet* modSet = LLVMModuleSet::getLLVMModuleSet();
+        std::unordered_map<const CallGraphEdge*, std::optional<unsigned>> callLineCache;
+        FuncInfoCache infoCache;
+        infoCache.reserve(M.size());  // upper bound on unique functions
+        writeHeader(os, M, config, entryNames);
+        for (const std::string& name : entryNames) {
+            CallGraphNode* entryNode = resolveEntry(callGraph, name);
+            if (!entryNode) {
+                llvm::errs() << "[WARN] entry function not found: " << name << "\n";
+                continue;
+            }
+            os << "#entry " << tsvEscape(name) << "\n";
+            unsigned spanCount = 0;
+            std::set<CallGraphNode*> in_stack;
+            std::unordered_set<std::string> reachable;
+            reachable.reserve(M.size());
+            emitSpans(entryNode, 0, std::nullopt, "root", std::nullopt,
+                      in_stack, lineRanges, modSet, callLineCache, infoCache,
+                      os, spanCount, reachable, config.excludeStd);
+            os << "#end " << tsvEscape(name) << " spans=" << spanCount
+               << " reachable_funcs=" << reachable.size() << "\n";
+        }
+        os.flush();
+        if (os.good() && fb.close())
             llvm::outs() << "report written to " << outPath << "\n";
         else
             llvm::errs() << "[ERROR] failed to write output file: " << outPath << "\n";

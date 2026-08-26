@@ -6,7 +6,7 @@ SVF-based call graph analysis tool that performs Andersen-style pointer analysis
 
 ### Analyzer
 
-- **`svf-api-demo/src/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and writes per-entry call graphs as JSON spans.
+- **`svf-api-demo/src/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and streams per-entry call graphs as tab-separated lines.
 - **`svf-api-demo/src/callgraph_analysis.cpp`** / **`svf-api-demo/include/callgraph_analysis.h`** — Analysis core (`analyzeCallGraph`) and `AnalysisConfig`.
 - **`svf-api-demo/CMakeLists.txt`** — CMake build (out-of-source into `build/`): builds the analyzer, the native test program, and the test bitcode.
 - **`svf-api-demo/build/clang_analyzer`** — Compiled analyzer binary (CMake build output).
@@ -236,6 +236,33 @@ pragmatic equivalent.
 ```bash
 ./svf-api-demo/build/test_complex
 ```
+
+## Output Format
+
+The report (default `<bitcode-stem>.callgraph.tsv`) is line-oriented so it can be
+streamed both when writing and when parsing — nothing is materialized in
+memory. `#`-prefixed lines are metadata/markers; every other line is one span,
+tab-separated, in pre-order (a span's parent always appears before it):
+
+```
+#schema_version 1
+#bitcode test_prog.bc
+#analysis pta=FlowSensitive context_sensitive=1 heap_model=0 exclude_std=1
+#entries main
+#entry main
+0		root	0	0	main	main	test_prog.c	3	6
+1	0	direct	1	0	foo()	_Z3foov	test_prog.c	8	10	4
+2	1	indirect	2	0	bar()	_Z3barv	test_prog.c	12	14	9
+3	1	direct	2	1	foo()	_Z3foov	test_prog.c	8	10	13
+#end main spans=4 reachable_funcs=3
+```
+
+Span-line columns: `span_id`, `parent_span_id`, `kind` (`root`/`direct`/`indirect`),
+`depth`, `cycle` (`0`/`1`), `function` (demangled, params stripped), `mangled`,
+`file`, `start_line`, `end_line`, `call_line`. Empty fields mean "absent" (the
+root has no parent; functions without debug info have no line columns). A `cycle`
+span is a recursion back-edge whose subtree is not expanded. `#end` carries the
+entry's span count and the number of unique reachable functions.
 
 ## Example Output
 

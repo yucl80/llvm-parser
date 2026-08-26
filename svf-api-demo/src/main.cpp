@@ -34,7 +34,8 @@ static void printUsage(const char* prog) {
                  << "                     in the call graph [default: excluded]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
-                 << "  --output <file>    Write JSON report to <file> (default <bitcode>.callgraph.json)\n";
+                 << "  --output <file>    Write line-oriented (TSV) call-graph report to <file>\n"
+                 << "                     (default <bitcode>.callgraph.tsv)\n";
 }
 
 static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {

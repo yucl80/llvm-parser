@@ -30,7 +30,7 @@ struct AnalysisConfig {
     /// Empty => default entry "main".
     std::vector<std::string> entries;
 
-    /// Output file path; empty => "<bitcode-stem>.callgraph.json".
+    /// Output file path; empty => "<bitcode-stem>.callgraph.tsv".
     std::string outputFile;
 };
 

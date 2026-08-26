@@ -12,4 +12,4 @@ test_complex
 *.bc
 
 # Analysis reports
-*.callgraph.json
+*.callgraph.tsv
