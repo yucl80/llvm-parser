@@ -15,15 +15,21 @@ struct AnalysisConfig {
     bool useVersionedFS = false;
     bool contextSensitive = true;
     bool heapModel = false;
-    /// Hide library code from the output call graph: C++ standard library /
-    /// runtime functions (std::, __gnu_cxx::, __cxa_* exception ABI, operator
-    /// new/delete) and any function defined in a system include header
-    /// (libstdc++/glibc templates etc., e.g. under /usr/include). Name-based
-    /// filtering alone misses many libstdc++ functions whose demangled names
-    /// carry a return-type prefix ("void std::..."), so file location is used
-    /// as the reliable signal. User callbacks invoked from inside library
-    /// functions (comparators, lambdas, functors) are still shown, grafted
-    /// onto the caller that reached them.
+    /// Hide library code from the output call graph so only the analyzed
+    /// application's own call chains are reported. A function is library code
+    /// when the file it is *defined* in is outside the application's source
+    /// tree (derived from the module's compile units) — this covers the C
+    /// library (strrchr, memcpy, ...), libstdc++/glibc headers (std::,
+    /// __gthread_mutex_lock, ...) and any other linked-in library source,
+    /// without enumerating function names. In addition:
+    ///  - symbols with no definition in the module are imported code;
+    ///  - the std::/__gnu_cxx:: namespaces and the C++ runtime ABI (__cxa_*,
+    ///    __gxx_*, _Unwind_*, operator new/delete) are matched by symbol;
+    ///  - calls made from inside a system header are dropped.
+    /// The symbol and body checks also work on release builds without -g, where
+    /// the definition file is unavailable. User callbacks invoked from inside
+    /// library functions (comparators, lambdas, functors) are still shown,
+    /// grafted onto the caller that reached them.
     bool excludeStd = true;
 
     /// Call-graph entry functions (demangled or mangled names).
@@ -34,8 +40,9 @@ struct AnalysisConfig {
     std::string outputFile;
 };
 
-/// Run call graph analysis on an LLVM module and write the per-entry
-/// call graphs (spans) as JSON to a file.
-void analyzeCallGraph(llvm::Module& M, const AnalysisConfig& config);
+/// Load the bitcode file at \p bcFile and run call graph analysis on it,
+/// writing the per-entry call graphs (spans) to a file.
+/// Returns 0 on success, non-zero if the bitcode cannot be loaded.
+int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config);
 
 #endif // CALLGRAPH_ANALYSIS_H

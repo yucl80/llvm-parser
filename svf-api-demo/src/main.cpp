@@ -1,19 +1,9 @@
 #include "callgraph_analysis.h"
 
-#include "WPA/Andersen.h"
-#include "Graphs/CallGraph.h"
-#include "SVF-LLVM/LLVMModule.h"
-#include "SVF-LLVM/SVFIRBuilder.h"
-
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Support/SourceMgr.h>
-
 #include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
-
-using namespace SVF;
 
 static void printUsage(const char* prog) {
     llvm::errs() << "Usage: " << prog << " [options] <bitcode-file>\n"
@@ -28,10 +18,11 @@ static void printUsage(const char* prog) {
                  << "  --heap-model       Heap object model (ModelConsts + ModelArrays)\n"
                  << "                     [opt-in; resolves local fn-ptr arrays but can\n"
                  << "                      under-resolve virtual/struct dispatch]\n"
-                 << "  --include-stdlib   Include C++ standard library and system-\n"
-                 << "                     header functions (std::, __gnu_cxx::, C++\n"
-                 << "                     runtime ABI, /usr/include libstdc++ etc.)\n"
-                 << "                     in the call graph [default: excluded]\n"
+                 << "  --include-stdlib   Include library code in the call graph\n"
+                 << "                     (functions defined outside the project's\n"
+                 << "                     own sources: C library, std::/__gnu_cxx::,\n"
+                 << "                     __cxa_*/__gxx_* runtime ABI)\n"
+                 << "                     [default: excluded]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
                  << "  --output <file>    Write line-oriented (TSV) call-graph report to <file>\n"
@@ -94,17 +85,7 @@ int main(int argc, char** argv) {
     int bcIdx;
     AnalysisConfig config = parseFlags(argc, argv, bcIdx);
 
-    const char* bcFile = (bcIdx > 0) ? argv[bcIdx] : "test_prog.bc";
+    std::string bcFile = (bcIdx > 0) ? argv[bcIdx] : "test_prog.bc";
 
-    llvm::SMDiagnostic err;
-    llvm::LLVMContext ctx;
-    std::unique_ptr<llvm::Module> mod = llvm::parseIRFile(bcFile, err, ctx);
-    if (!mod) {
-        llvm::errs() << "Failed to load bitcode file: " << bcFile << "\n";
-        return 1;
-    }
-
-    analyzeCallGraph(*mod, config);
-
-    return 0;
+    return analyzeCallGraph(bcFile, config);
 }

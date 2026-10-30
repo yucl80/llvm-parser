@@ -142,17 +142,30 @@ measurably under-resolves virtual dispatch through base-class arrays and
 struct dispatch tables — a net completeness loss on the test suite — so it
 is opt-in.
 
-The output call graph **excludes library code** by default to keep the tree
-focused on user code:
-- C++ standard library / runtime functions by name: `std::`, `__gnu_cxx::`,
-  `__cxa_*` exception ABI, `operator new/delete`;
-- any function defined in a **system include header** (libstdc++/glibc
-  templates under `/usr/include`, etc.) — judged by its debug-info file path,
-  which catches libstdc++ functions whose demangled names carry a return-type
-  prefix (`void std::...`, `decltype(...) std::...`) and would slip past a
-  name-only filter;
-- library/runtime functions with **no debug info** (`printf`, LLVM intrinsics,
-  `__dynamic_cast`) — when the module does carry debug info elsewhere.
+The output call graph **excludes library code** by default, so only the
+analyzed application's own call chains are reported. The decision is made from
+**where each function is defined**, not from a list of library function names:
+
+- the application's source tree is derived from the module's **compile units**
+  (each unit's directory and its parent, so project headers next to the sources
+  stay application code);
+- a function whose definition file lies **outside that tree** is library code —
+  this is what filters the C library (`strrchr`, `memcpy`, ...), libstdc++
+  headers (`std::`, `__gthread_mutex_lock`, ...) and any other library source
+  linked into the module, regardless of where the toolchain keeps its headers;
+- a function with **no definition in the module** (a body-less declaration) is
+  imported library code. This check runs on the *original* module, before SVF's
+  ExtAPI materialises stub bodies for modelled C functions;
+- symbols whose namespace identifies them as std/runtime — `std::`,
+  `__gnu_cxx::`, `__cxa_*`, `__gxx_*`, `_Unwind_*`, sanitizer hooks,
+  `operator new/delete` — are filtered by symbol, so they are also hidden on
+  release builds **without `-g`**;
+- library/runtime functions with **no debug info** when the module carries
+  debug info elsewhere, and calls made from inside a system header.
+
+On a build **without `-g`** there is no definition file to attribute by, so
+body-bearing header inlines (e.g. `__gthread_mutex_lock`) cannot be
+classified; declarations and std symbols are still filtered.
 
 User callbacks invoked from inside library functions (comparators, lambdas,
 functors, `std::function` targets) are still shown, grafted onto the caller
@@ -166,7 +179,7 @@ that reached them. Pass `--include-stdlib` to keep everything in the output.
 | `--ander` | Downgrade to flow-insensitive AndersenWaveDiff |
 | `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
 | `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
-| `--include-stdlib` | Keep C++ std / system-header / no-debug-info library functions in the call graph [default: excluded] |
+| `--include-stdlib` | Keep C++ std / C library / system-header / declaration-only library functions in the call graph [default: excluded] |
 
 ```bash
 # Default: flow-sensitive + context-sensitive (most complete & precise)
@@ -245,24 +258,33 @@ memory. `#`-prefixed lines are metadata/markers; every other line is one span,
 tab-separated, in pre-order (a span's parent always appears before it):
 
 ```
-#schema_version 1
+#schema_version 2
 #bitcode test_prog.bc
 #analysis pta=FlowSensitive context_sensitive=1 heap_model=0 exclude_std=1
 #entries main
 #entry main
 0		root	0	0	main	main	test_prog.c	3	6
-1	0	direct	1	0	foo()	_Z3foov	test_prog.c	8	10	4
-2	1	indirect	2	0	bar()	_Z3barv	test_prog.c	12	14	9
-3	1	direct	2	1	foo()	_Z3foov	test_prog.c	8	10	13
+1	0	direct	1	0	foo()	_Z3foov	test_prog.c	8	10	test_prog.c	4
+2	1	indirect	2	0	bar()	_Z3barv	test_prog.c	12	14	test_prog.c	9
+3	1	direct	2	1	foo()	_Z3foov	test_prog.c	8	10	test_prog.c	13
 #end main spans=4 reachable_funcs=3
 ```
 
 Span-line columns: `span_id`, `parent_span_id`, `kind` (`root`/`direct`/`indirect`),
 `depth`, `cycle` (`0`/`1`), `function` (demangled, params stripped), `mangled`,
-`file`, `start_line`, `end_line`, `call_line`. Empty fields mean "absent" (the
-root has no parent; functions without debug info have no line columns). A `cycle`
-span is a recursion back-edge whose subtree is not expanded. `#end` carries the
-entry's span count and the number of unique reachable functions.
+`file`, `start_line`, `end_line`, `call_file`, `call_line`. `call_file` and
+`call_line` are the file and line of the call site backing the edge — the
+location in the caller where the function is invoked (the representative site,
+lowest line number, when an edge has several). Spans whose call site is inside
+a system include header (`/usr/...`) are dropped entirely: a call that happens
+inside standard-library code (C/C++/LLVM headers, e.g. a user callback invoked
+from within libstdc++) is not part of the program's own call graph. The
+callback's own calls, made from user code, are still shown grafted onto the
+nearest emitted ancestor. Empty fields mean "absent" (the root has no parent;
+functions without debug info have no line columns; a call without debug info
+has no call-site columns). A `cycle` span is a recursion back-edge whose
+subtree is not expanded. `#end` carries the entry's span count and the number
+of unique reachable functions.
 
 ## Example Output
 

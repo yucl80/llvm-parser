@@ -49,7 +49,10 @@ endif()
 # Analysis core (no main) -- reusable library, the CLI driver links it.
 # SVF/LLVM include dirs and libs are PUBLIC so consumers inherit them.
 # ---------------------------------------------------------------------------
-add_library(svfanalyzer STATIC src/callgraph_analysis.cpp)
+add_library(svfanalyzer STATIC
+    src/callgraph_analysis.cpp
+    src/callgraph_output.cpp
+    src/function_filter.cpp)
 target_include_directories(svfanalyzer PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(svfanalyzer SYSTEM PUBLIC
