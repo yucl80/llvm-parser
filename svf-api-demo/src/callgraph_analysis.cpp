@@ -34,7 +34,8 @@ int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config) {
     llvm::errs() << "[Config] pta=" << ptaName
                  << " context_sensitive=" << (config.contextSensitive ? "true" : "false")
                  << " heap_model=" << (config.heapModel ? "true" : "false")
-                 << " exclude_std=" << (config.excludeStd ? "true" : "false") << "\n";
+                 << " exclude_std=" << (config.excludeStd ? "true" : "false")
+                 << " name_filters=" << config.nameFilters.size() << "\n";
 
     if (config.heapModel) {
         Options::ModelConsts.setValue(true);
@@ -51,7 +52,9 @@ int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config) {
     // This must run BEFORE SVF builds its model: SVF's ExtAPI materializes stub
     // bodies for modelled C library functions (strrchr, strchr, ...), after
     // which an imported declaration would look like a definition.
-    const FunctionFilter filter = FunctionFilter::build(M);
+    // The user's name filters (--filter-file) are compiled into the same object.
+    const FunctionFilter filter =
+        FunctionFilter::build(M, config.nameFilters);
 
     // 1. Build SVFModule
     LLVMModuleSet::buildSVFModule(M);

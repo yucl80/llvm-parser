@@ -52,6 +52,8 @@ endif()
 add_library(svfanalyzer STATIC
     src/callgraph_analysis.cpp
     src/callgraph_output.cpp
+    src/callgraph_tsv_sink.cpp
+    src/callgraph_tree_sink.cpp
     src/function_filter.cpp)
 target_include_directories(svfanalyzer PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include")

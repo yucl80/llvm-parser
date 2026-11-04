@@ -25,8 +25,50 @@ static void printUsage(const char* prog) {
                  << "                     [default: excluded]\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
-                 << "  --output <file>    Write line-oriented (TSV) call-graph report to <file>\n"
-                 << "                     (default <bitcode>.callgraph.tsv)\n";
+                 << "  --filter-file <f>  Hide functions matching the regular expressions in\n"
+                 << "                     <f> (one ECMAScript regex per line; blank lines\n"
+                 << "                     and '#' comments are skipped). Matched functions are\n"
+                 << "                     hidden like library code: the user functions they\n"
+                 << "                     call are still reported, their own callees are not\n"
+                 << "  --format <tsv|tree>\n"
+                 << "                     Report layout: an indented call tree per entry\n"
+                 << "                     with [indirect]/[cycle] markers and call-site\n"
+                 << "                     locations (default), or tab-separated spans\n"
+                 << "  --output <file>    Write the call-graph report to <file>\n"
+                 << "                     (default <bitcode>.callgraph.tree, or\n"
+                 << "                     <bitcode>.callgraph.tsv with --format tsv)\n";
+}
+
+/// Trim leading/trailing blanks and tabs, so indented patterns and stray
+/// trailing whitespace in a filter file do not change what is matched.
+static std::string trim(const std::string& s) {
+    const char* kBlanks = " \t";
+    size_t begin = s.find_first_not_of(kBlanks);
+    if (begin == std::string::npos) return {};
+    size_t end = s.find_last_not_of(kBlanks);
+    return s.substr(begin, end - begin + 1);
+}
+
+/// Read a line-oriented configuration file: one regex per line, blank lines and
+/// '#' comments skipped. Lines are trimmed; CRLF endings are accepted.
+/// Returns false when the file cannot be opened.
+static bool readPatternFile(const std::string& path,
+                            std::vector<std::string>& patterns) {
+    std::ifstream in(path);
+    if (!in) {
+        llvm::errs() << "[ERROR] cannot open filter file: " << path << "\n";
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        line = trim(line);
+        if (line.empty() || line[0] == '#')
+            continue;
+        patterns.push_back(std::move(line));
+    }
+    return true;
 }
 
 static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
@@ -66,6 +108,23 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
                     line.pop_back();
                 if (!line.empty())
                     config.entries.push_back(line);
+            }
+        } else if (strcmp(argv[i], "--filter-file") == 0 && i + 1 < argc) {
+            // A missing filter file is not fatal: the analysis runs unfiltered
+            // rather than silently hiding nothing while claiming a filter.
+            const std::string path = argv[++i];
+            if (readPatternFile(path, config.nameFilters))
+                config.filterFile = path;
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            const char* fmt = argv[++i];
+            if (strcmp(fmt, "tsv") == 0) {
+                config.format = AnalysisConfig::ReportFormat::Tsv;
+            } else if (strcmp(fmt, "tree") == 0) {
+                config.format = AnalysisConfig::ReportFormat::Tree;
+            } else {
+                llvm::errs() << "[ERROR] unknown --format '" << fmt
+                             << "' (expected tsv or tree)\n";
+                exit(1);
             }
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             config.outputFile = argv[++i];

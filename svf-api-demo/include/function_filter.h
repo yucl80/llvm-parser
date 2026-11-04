@@ -4,6 +4,7 @@
 #include <llvm/IR/Module.h>
 
 #include <map>
+#include <regex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -45,14 +46,36 @@ bool isSystemHeaderFile(const std::string& file);
 ///     recognised — by the file the function is defined in, not by its name;
 ///  4. it has no debug info at all while the module carries debug info
 ///     elsewhere.
+///
+/// Independently of that classification, the user can name functions to hide
+/// with a filter file (one ECMAScript regular expression per line, see
+/// AnalysisConfig::nameFilters). Hidden functions — library code and filter
+/// matches alike — emit no span of their own: an edge from a hidden function
+/// into user code is still reported, grafted onto the nearest emitted ancestor,
+/// while edges between two hidden functions are not traversed at all, so the
+/// library's internal sub-call tree stays out of the report.
 class FunctionFilter {
 public:
     /// Classify the module's functions from their definition sites. Must run
-    /// before SVF builds its model (see the class comment).
-    static FunctionFilter build(const llvm::Module& M);
+    /// before SVF builds its model (see the class comment). \p namePatterns is
+    /// the user's filter file content; an invalid expression is reported and
+    /// skipped.
+    static FunctionFilter build(const llvm::Module& M,
+                                const std::vector<std::string>& namePatterns = {});
 
     /// True when \p mangled / \p demangled names library code.
     bool isExcluded(const std::string& mangled,
+                    const std::string& demangled) const;
+
+    /// True when \p mangled is defined inside the application's own source
+    /// tree, i.e. genuinely user code. Keeps a callback visible even when the
+    /// call site that reaches it sits in a system header.
+    bool isAppFunction(const std::string& mangled) const;
+
+    /// True when a user name pattern from the filter file matches \p mangled or
+    /// \p demangled. Matching is a substring (regex) search, so "log" hides
+    /// every function whose name contains it and "^log_" anchors at the start.
+    bool isFiltered(const std::string& mangled,
                     const std::string& demangled) const;
 
     /// Line range recorded for \p mangled, or nullptr when the module has no
@@ -65,6 +88,9 @@ private:
 
     std::map<std::string, FuncLineRange> lineRanges_;
     std::unordered_set<std::string> externalDecls_;
+    /// Compiled user name patterns (filter file), empty when no filter file was
+    /// given.
+    std::vector<std::regex> namePatterns_;
     /// The analyzed application's own source tree, derived from the module's
     /// compile units: normalized, sorted, no trailing '/'.
     std::vector<std::string> appDirs_;

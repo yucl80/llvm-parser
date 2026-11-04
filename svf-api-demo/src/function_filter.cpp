@@ -2,6 +2,7 @@
 
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 
@@ -196,7 +197,8 @@ static bool getFuncLineRange(const llvm::Function* F, FuncLineRange& range) {
     return true;
 }
 
-FunctionFilter FunctionFilter::build(const llvm::Module& M) {
+FunctionFilter FunctionFilter::build(
+    const llvm::Module& M, const std::vector<std::string>& namePatterns) {
     FunctionFilter filter;
     for (const llvm::Function& F : M) {
         FuncLineRange range;
@@ -206,6 +208,21 @@ FunctionFilter FunctionFilter::build(const llvm::Module& M) {
             filter.externalDecls_.insert(F.getName().str());
     }
     filter.appDirs_ = buildAppSourceDirs(M);
+
+    // User filter file: one ECMAScript regex per line. A malformed expression is
+    // a configuration error, not a reason to abort the analysis, so it is
+    // reported and skipped.
+    filter.namePatterns_.reserve(namePatterns.size());
+    for (const std::string& pattern : namePatterns) {
+        try {
+            filter.namePatterns_.emplace_back(pattern,
+                                              std::regex::ECMAScript |
+                                                  std::regex::optimize);
+        } catch (const std::regex_error& e) {
+            llvm::errs() << "[WARN] ignoring invalid filter pattern \"" << pattern
+                         << "\": " << e.what() << "\n";
+        }
+    }
     return filter;
 }
 
@@ -243,6 +260,39 @@ bool FunctionFilter::isExcluded(const std::string& mangled,
     return !lineRanges_.empty();
 }
 
+/// Same definition-site test as isExcluded, stated positively: a function is
+/// application code when it is defined (not merely declared) in one of the
+/// compile units' source trees. Used to protect user callbacks from the
+/// system-header call-site heuristic, which would otherwise hide a callback
+/// invoked from out-of-line library code.
+bool FunctionFilter::isAppFunction(const std::string& mangled) const {
+    if (externalDecls_.count(mangled)) return false;
+    auto it = lineRanges_.find(mangled);
+    if (it == lineRanges_.end()) return false;  // no debug info: unattributable
+    if (appDirs_.empty())
+        return !isSystemHeaderFile(it->second.defFile);
+    return inAppTree(it->second.defFile);
+}
+
+/// Substring regex match against every name the function is known by: the
+/// demangled signature, the demangled name without parameters ("foo" for
+/// "foo(int)"), and the raw mangled symbol (so filters can target one overload).
+/// Avoiding a no-op second search when the two demangled forms coincide keeps
+/// the per-function cost at #patterns matches.
+bool FunctionFilter::isFiltered(const std::string& mangled,
+                                const std::string& demangled) const {
+    if (namePatterns_.empty()) return false;
+    const std::string base = stripParams(demangled);
+    for (const std::regex& re : namePatterns_) {
+        if (std::regex_search(demangled, re)) return true;
+        if (base != demangled && std::regex_search(base, re)) return true;
+        if (std::regex_search(mangled, re)) return true;
+    }
+    return false;
+}
+
+/// Line range recorded for \p mangled, or nullptr when the module has no debug
+/// info for it.
 const FuncLineRange* FunctionFilter::findLineRange(
     const std::string& mangled) const {
     auto it = lineRanges_.find(mangled);

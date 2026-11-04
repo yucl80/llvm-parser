@@ -36,7 +36,28 @@ struct AnalysisConfig {
     /// Empty => default entry "main".
     std::vector<std::string> entries;
 
-    /// Output file path; empty => "<bitcode-stem>.callgraph.tsv".
+    /// User name filters, one ECMAScript regular expression per line of the
+    /// file given with --filter-file (blank lines and '#' comments are skipped).
+    /// A function whose demangled name, param-stripped name, or mangled symbol
+    /// matches any expression emits no span, exactly like library code: the
+    /// user functions it calls are still reported (grafted onto the nearest
+    /// visible ancestor), while calls between two hidden functions are not
+    /// traversed. Applied whether or not excludeStd is on.
+    std::vector<std::string> nameFilters;
+
+    /// Path of the filter file (for the report header); empty when unused.
+    std::string filterFile;
+
+    /// Report rendering. Tree (default) renders each entry's call chain as an
+    /// indented ASCII tree (├──/└── connectors, [indirect]/[cycle] markers,
+    /// call-site locations) for human reading; Tsv streams one tab-separated
+    /// span per line. Both carry exactly the same spans; the tree view buffers
+    /// one entry's spans in memory to place the connectors.
+    enum class ReportFormat { Tsv, Tree };
+    ReportFormat format = ReportFormat::Tree;
+
+    /// Output file path; empty => "<bitcode-stem>.callgraph.tree" (Tree) or
+    /// "<bitcode-stem>.callgraph.tsv" (Tsv).
     std::string outputFile;
 };
 
