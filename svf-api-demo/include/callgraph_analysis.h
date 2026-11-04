@@ -13,6 +13,24 @@
 struct AnalysisConfig {
     bool useFlowSensitive = true;
     bool useVersionedFS = false;
+    /// Demand-driven (DFA) mode: instead of a full points-to solve, only the
+    /// function-pointer / vtable-pointer variables feeding indirect callsites
+    /// are queried on SVF's value-flow graph (ContextDDA / FlowDDA). Far
+    /// cheaper than FlowSensitive + SVFG for call-graph construction.
+    bool useDDA = false;
+    /// With useDDA: use flow-sensitive DDA (FlowDDA) instead of the default
+    /// context-sensitive DDA (ContextDDA).
+    bool ddaFlowSensitive = false;
+    /// With useDDA: build the optimised pointer-only SVFG (SVFGOPT — merges
+    /// context-insensitive regions, eliminates formal-in/actual-out). A
+    /// smaller graph speeds up the on-demand traversal at some precision
+    /// cost. Opt-in because of that trade-off.
+    bool ddaOptSvfg = false;
+    /// With useDDA: maximum calling-context length for the on-demand
+    /// traversal (SVF MaxContextLen, default 3). Larger values are more
+    /// precise but slower; queries hitting the limit fall back to the
+    /// Andersen pre-analysis result.
+    unsigned ddaContextLen = 3;
     bool contextSensitive = true;
     bool heapModel = false;
     /// Hide library code from the output call graph so only the analyzed
@@ -60,6 +78,10 @@ struct AnalysisConfig {
     /// "<bitcode-stem>.callgraph.tsv" (Tsv).
     std::string outputFile;
 };
+
+/// Human-readable name of the selected pointer analysis engine (used in the
+/// report's "#analysis pta=..." header line and the stderr config log).
+std::string analysisPtaName(const AnalysisConfig& config);
 
 /// Load the bitcode file at \p bcFile and run call graph analysis on it,
 /// writing the per-entry call graphs (spans) to a file.

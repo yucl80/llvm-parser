@@ -217,13 +217,7 @@ static void writeHeader(std::ostream& os,
                         const std::vector<std::string>& entryNames) {
     os << "#schema_version 2\n";
     os << "#bitcode " << tsvEscape(M.getModuleIdentifier()) << "\n";
-    os << "#analysis pta=";
-    if (config.useFlowSensitive)
-        os << "FlowSensitive";
-    else if (config.useVersionedFS)
-        os << "VersionedFlowSensitive";
-    else
-        os << "AndersenWaveDiff";
+    os << "#analysis pta=" << analysisPtaName(config);
     os << " context_sensitive=" << (config.contextSensitive ? 1 : 0)
        << " heap_model=" << (config.heapModel ? 1 : 0)
        << " exclude_std=" << (config.excludeStd ? 1 : 0) << "\n";

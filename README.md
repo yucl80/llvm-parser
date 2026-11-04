@@ -6,8 +6,13 @@ SVF-based call graph analysis tool that performs Andersen-style pointer analysis
 
 ### Analyzer
 
-- **`svf-api-demo/src/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and streams per-entry call graphs as tab-separated lines.
+- **`svf-api-demo/src/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and renders per-entry call graphs (ASCII tree by default, or tab-separated spans).
 - **`svf-api-demo/src/callgraph_analysis.cpp`** / **`svf-api-demo/include/callgraph_analysis.h`** — Analysis core (`analyzeCallGraph`) and `AnalysisConfig`.
+- **`svf-api-demo/src/callgraph_output.cpp`** / **`svf-api-demo/include/callgraph_output.h`** — Report writer: call-graph traversal into spans, metadata header, per-entry sink dispatch.
+- **`svf-api-demo/src/callgraph_tsv_sink.cpp`** / **`svf-api-demo/include/callgraph_tsv_sink.h`** — `TsvSink` (machine-readable tab-separated spans) plus the shared span-line/escaping writers.
+- **`svf-api-demo/src/callgraph_tree_sink.cpp`** / **`svf-api-demo/include/callgraph_tree_sink.h`** — `TreeSink` (indented ASCII call tree per entry).
+- **`svf-api-demo/include/callgraph_sink.h`** / **`svf-api-demo/include/callgraph_span.h`** — `SpanSink` traversal-output interface and the shared span data types.
+- **`svf-api-demo/src/function_filter.cpp`** / **`svf-api-demo/include/function_filter.h`** — Library-code classification, user filter patterns, and debug-line ranges.
 - **`svf-api-demo/CMakeLists.txt`** — CMake build (out-of-source into `build/`): builds the analyzer, the native test program, and the test bitcode.
 - **`svf-api-demo/build/clang_analyzer`** — Compiled analyzer binary (CMake build output).
 
@@ -167,9 +172,38 @@ On a build **without `-g`** there is no definition file to attribute by, so
 body-bearing header inlines (e.g. `__gthread_mutex_lock`) cannot be
 classified; declarations and std symbols are still filtered.
 
-User callbacks invoked from inside library functions (comparators, lambdas,
-functors, `std::function` targets) are still shown, grafted onto the caller
-that reached them. Pass `--include-stdlib` to keep everything in the output.
+Three rules shape the reported call tree. They apply identically to library
+code and to functions hidden by a filter file:
+
+1. an edge from a user function into a **hidden** function (library code or a
+   filter match) is **not** reported;
+2. an edge from a hidden function into a **user** function **is** reported: the
+   user function is grafted onto the nearest visible ancestor (a callback
+   invoked from inside library machinery keeps its own subtree);
+3. the hidden function's **own call tree is not traversed**, so calls between
+   two hidden functions never appear and callbacks reachable only through
+   library-internal chains are not reported.
+
+Pass `--include-stdlib` to keep library code in the output; filter-file matches
+are still hidden.
+
+**Project-specific filtering** is done with `--filter-file <file>`: the file
+holds one regular expression per line (ECMAScript syntax, blank lines and
+`#`-comment lines are skipped). Every function whose demangled name,
+parameter-stripped name, or mangled symbol matches an expression is hidden
+exactly like library code — rules 1–3 above apply, so a noisy helper (`log_*`,
+tracing wrappers, test scaffolding) disappears while the user functions it
+calls stay visible. Matching is a substring search, so `log` matches everywhere
+in the name and `^log_` anchors at the start. Invalid expressions are reported
+on stderr and skipped, and the filter applies regardless of
+`--include-stdlib`.
+
+```
+# hide logging helpers; the user functions they call are still shown
+^log_
+^trace_
+_dbg$
+```
 
 | Flag | Description |
 |------|-------------|
@@ -177,9 +211,16 @@ that reached them. Pass `--include-stdlib` to keep everything in the output.
 | `--fs` | FlowSensitive (FSSPARSE_WPA) — sparse flow-sensitive analysis [default on] |
 | `--vfs` | VersionedFlowSensitive (VFS_WPA) — versioned flow-sensitive |
 | `--ander` | Downgrade to flow-insensitive AndersenWaveDiff |
+| `--dda` | Demand-driven value-flow analysis (ContextDDA): only the function-pointer / vtable-pointer variables feeding indirect callsites are solved on demand on the SVFG — much faster than a full points-to solve for call-graph construction |
+| `--dda-flow` | Demand-driven with FlowDDA (flow-sensitive on-demand solve; implies `--dda`) |
+| `--dda-cxt-len <n>` | DDA: maximum calling-context length (SVF `MaxContextLen`, default 3; larger = more precise, slower) |
+| `--dda-opt-svfg` | DDA: build the optimised pointer-only SVFG (SVFGOPT — merges context-insensitive regions, drops formal-in/actual-out): smaller graph, faster on-demand traversal, some precision loss |
 | `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
 | `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
 | `--include-stdlib` | Keep C++ std / C library / system-header / declaration-only library functions in the call graph [default: excluded] |
+| `--entry <name>` / `--entry-file <f>` | Call-graph entry functions (repeatable; demangled or mangled) |
+| `--filter-file <f>` | Hide functions matching the regexes in `<f>` (one per line), like library code: their direct user callees stay visible, their internal call tree does not |
+| `--format <tsv\|tree>` | Report layout: an indented ASCII call tree per entry (default) or tab-separated spans [default: tree] |
 
 ```bash
 # Default: flow-sensitive + context-sensitive (most complete & precise)
@@ -189,6 +230,10 @@ LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib \
 # Flow-insensitive Andersen (faster, less precise)
 LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib \
   ./svf-api-demo/build/clang_analyzer --ander svf-api-demo/build/tests/test_complex.bc
+
+# Demand-driven value-flow analysis (fastest precise mode for call graphs)
+LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib \
+  ./svf-api-demo/build/clang_analyzer --dda svf-api-demo/build/tests/test_complex.bc
 
 # Also resolve indirect calls through local fn-ptr arrays (may lose
 # virtual/struct dispatch targets)
@@ -252,15 +297,47 @@ pragmatic equivalent.
 
 ## Output Format
 
-The report (default `<bitcode-stem>.callgraph.tsv`) is line-oriented so it can be
-streamed both when writing and when parsing — nothing is materialized in
-memory. `#`-prefixed lines are metadata/markers; every other line is one span,
-tab-separated, in pre-order (a span's parent always appears before it):
+The report comes in two layouts carrying exactly the same spans, selected with
+`--format` (default `tree`). The same metadata header and per-entry summary are
+written in both; the hiding rules and `--filter-file` apply identically.
+
+### Tree Format (default)
+
+The default layout renders each entry's call chain as an indented ASCII tree:
+one line per span, `├──`/`└──` connectors with `│` verticals,
+`[indirect]`/`[cycle]` markers, and the call site in parentheses. The default
+output name is `<bitcode-stem>.callgraph.tree`:
+
+```
+#schema_version 2
+#bitcode build/tests/test_prog.bc
+#analysis pta=FlowSensitive context_sensitive=1 heap_model=0 exclude_std=1
+#entries main
+===== entry: main =====
+main
+    ├── foo  (tests/test_prog.c:6)
+    ├── bar  (tests/test_prog.c:7)
+    └── zoo  (tests/test_prog.c:8)
+===== end: main spans=4 reachable=4 =====
+```
+
+The definition file / line-range columns are not repeated on tree lines —
+consult the TSV report for them. Unlike the fully streamed TSV layout, the tree
+buffers one entry's spans in memory to place the connectors.
+
+### TSV Format
+
+`--format tsv` writes a line-oriented report (default
+`<bitcode-stem>.callgraph.tsv`) so it can be streamed both when writing and
+when parsing — nothing is materialized in memory. `#`-prefixed lines are
+metadata/markers; every other line is one span, tab-separated, in pre-order (a
+span's parent always appears before it):
 
 ```
 #schema_version 2
 #bitcode test_prog.bc
 #analysis pta=FlowSensitive context_sensitive=1 heap_model=0 exclude_std=1
+#filter_file filters.txt patterns=2
 #entries main
 #entry main
 0		root	0	0	main	main	test_prog.c	3	6
@@ -275,16 +352,17 @@ Span-line columns: `span_id`, `parent_span_id`, `kind` (`root`/`direct`/`indirec
 `file`, `start_line`, `end_line`, `call_file`, `call_line`. `call_file` and
 `call_line` are the file and line of the call site backing the edge — the
 location in the caller where the function is invoked (the representative site,
-lowest line number, when an edge has several). Spans whose call site is inside
-a system include header (`/usr/...`) are dropped entirely: a call that happens
-inside standard-library code (C/C++/LLVM headers, e.g. a user callback invoked
-from within libstdc++) is not part of the program's own call graph. The
-callback's own calls, made from user code, are still shown grafted onto the
-nearest emitted ancestor. Empty fields mean "absent" (the root has no parent;
+lowest line number, when an edge has several). Hidden functions (library code,
+filter matches, and library callees reached from a call site inside a system
+include header) emit no span of their own, and their internal call tree is not
+traversed; their user-code callees are still shown, grafted onto the nearest
+visible ancestor. A user function is never hidden merely because its call site
+sits in a system header. Empty fields mean "absent" (the root has no parent;
 functions without debug info have no line columns; a call without debug info
 has no call-site columns). A `cycle` span is a recursion back-edge whose
 subtree is not expanded. `#end` carries the entry's span count and the number
-of unique reachable functions.
+of unique reachable functions. `#filter_file` records the filter file applied and
+its pattern count; it is omitted when no filter file was given.
 
 ## Example Output
 

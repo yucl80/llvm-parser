@@ -71,6 +71,49 @@ add_executable(clang_analyzer src/main.cpp)
 target_link_libraries(clang_analyzer PRIVATE svfanalyzer)
 
 # ---------------------------------------------------------------------------
+# Class extractor: ./class_extractor [flags] <bitcode-file>
+#
+# Reads the module's DWARF debug info directly through the LLVM API (no SVF
+# model is built), so it only needs libLLVM.
+# ---------------------------------------------------------------------------
+add_executable(class_extractor src/class_extractor.cpp)
+target_include_directories(class_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+target_link_libraries(class_extractor PRIVATE "${LLVM_LIB}")
+set_target_properties(class_extractor PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
+
+# ---------------------------------------------------------------------------
+# Class dumper: ./class_dump [--all] <source> [...]
+#
+# Source-level extractor (classes, member functions, inheritance, overrides)
+# built on libclang's C API. It needs only clang-c headers + libclang.so --
+# no SVF and no libLLVM.
+# ---------------------------------------------------------------------------
+# Use the libclang from LLVM_PREFIX (not a cached find_library result, which
+# would go stale when LLVM_PREFIX changes); dev symlink first, soname second.
+set(CLANG_LIB "")
+foreach(candidate IN ITEMS
+        "${LLVM_PREFIX}/lib/libclang.so"
+        "${LLVM_PREFIX}/lib/libclang.so.1"
+        "/usr/lib/x86_64-linux-gnu/libclang.so"
+        "/usr/lib/x86_64-linux-gnu/libclang.so.1")
+  if(EXISTS "${candidate}")
+    set(CLANG_LIB "${candidate}")
+    break()
+  endif()
+endforeach()
+if(NOT CLANG_LIB)
+  message(FATAL_ERROR
+    "Could not find libclang in ${LLVM_PREFIX}/lib; install libclang-21-dev "
+    "or pass -DLLVM_PREFIX=<path>.")
+endif()
+
+add_executable(class_dump src/class_dump.cpp)
+target_compile_options(class_dump PRIVATE -Wall -Wextra)
+target_include_directories(class_dump SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+target_link_libraries(class_dump PRIVATE "${CLANG_LIB}" ${CMAKE_DL_LIBS})
+set_target_properties(class_dump PROPERTIES BUILD_RPATH "${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
 # Native test program (builds with the default host compiler; no SVF).
 # ---------------------------------------------------------------------------
 add_executable(test_complex tests/test_complex.cpp)
@@ -143,6 +186,9 @@ foreach(lib IN LISTS RUNTIME_LIBS)
     list(APPEND RUNTIME_LIB_FILES "${out}")
 endforeach()
 add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
+
+# class_extractor resolves libLLVM through its $ORIGIN/lib rpath.
+add_dependencies(class_extractor runtime-libs)
 
 # Assemble a clean self-contained deployment folder: clang_analyzer + lib/.
 add_custom_target(deploy

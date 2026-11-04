@@ -13,6 +13,22 @@ static void printUsage(const char* prog) {
                  << "  --fs               Use flow-sensitive analysis (FSSPARSE_WPA) [default on]\n"
                  << "  --vfs              Use versioned flow-sensitive analysis (VFS_WPA)\n"
                  << "  --ander            Downgrade to flow-insensitive AndersenWaveDiff\n"
+                 << "  --dda              Demand-driven value-flow analysis (ContextDDA):\n"
+                 << "                     only the function-pointer / vtable-pointer\n"
+                 << "                     variables feeding indirect callsites are\n"
+                 << "                     solved on demand on the SVFG — much faster\n"
+                 << "                     than a full points-to solve for call-graph\n"
+                 << "                     construction [default: off]\n"
+                 << "  --dda-flow         Demand-driven with FlowDDA (flow-sensitive\n"
+                 << "                     instead of context-sensitive on-demand solve;\n"
+                 << "                     implies --dda)\n"
+                 << "  --dda-cxt-len <n>  DDA: maximum calling-context length\n"
+                 << "                     (SVF MaxContextLen, default 3; larger = more\n"
+                 << "                     precise, slower)\n"
+                 << "  --dda-opt-svfg     DDA: build the optimised pointer-only SVFG\n"
+                 << "                     (SVFGOPT — merges context-insensitive regions,\n"
+                 << "                     drops formal-in/actual-out): smaller graph,\n"
+                 << "                     faster on-demand traversal, some precision loss\n"
                  << "  --cs               Context sensitivity [default on; SVF SVFG is\n"
                  << "                     context-sensitive by default]\n"
                  << "  --heap-model       Heap object model (ModelConsts + ModelArrays)\n"
@@ -86,6 +102,24 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
             // Downgrade to flow-insensitive AndersenWaveDiff (faster, less precise).
             config.useFlowSensitive = false;
             config.useVersionedFS = false;
+            config.useDDA = false;
+        } else if (strcmp(argv[i], "--dda") == 0) {
+            // Demand-driven value-flow analysis: solve only the pointers
+            // feeding indirect callsites (fastest precise mode).
+            config.useDDA = true;
+            config.ddaFlowSensitive = false;
+            config.useFlowSensitive = false;
+            config.useVersionedFS = false;
+        } else if (strcmp(argv[i], "--dda-flow") == 0) {
+            config.useDDA = true;
+            config.ddaFlowSensitive = true;
+            config.useFlowSensitive = false;
+            config.useVersionedFS = false;
+        } else if (strcmp(argv[i], "--dda-cxt-len") == 0 && i + 1 < argc) {
+            config.ddaContextLen =
+                static_cast<unsigned>(strtoul(argv[++i], nullptr, 10));
+        } else if (strcmp(argv[i], "--dda-opt-svfg") == 0) {
+            config.ddaOptSvfg = true;
         } else if (strcmp(argv[i], "--cs") == 0) {
             config.contextSensitive = true;
         } else if (strcmp(argv[i], "--heap-model") == 0) {
