@@ -5,36 +5,51 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <utility>
 
-/// Strip a trailing parameter list: "foo(int)" -> "foo".
+/// Strip the outermost parameter list of a demangled name:
+///   "foo(int)"                                  -> "foo"
+///   "operator()(int)"                           -> "operator()"
+///   "(anonymous namespace)::Service::get(int)"  -> "(anonymous namespace)::Service::get"
+///
+/// The parameter list is the *last balanced* parenthesis group, not the first
+/// '('. The Itanium demangler spells unnamed namespaces as
+/// "(anonymous namespace)", and function/template parameters can contain
+/// parentheses of their own ("foo(void (*)(int))"). Cutting at the first '('
+/// used to erase the whole name of every function in an anonymous namespace,
+/// so those spans were written with an empty function column.
 std::string stripParams(std::string s) {
-    size_t p = s.find('(');
-    if (p != std::string::npos)
-        s.erase(p);
+    const size_t close = s.rfind(')');
+    if (close == std::string::npos)
+        return s;  // C symbol or an undemangled name: no parameter list
+
+    // Walk back from the final ')' to the '(' that balances it. Nested groups
+    // are counted so they cannot be mistaken for the parameter list.
+    int depth = 0;
+    for (size_t i = close + 1; i-- > 0;) {
+        if (s[i] == ')') {
+            ++depth;
+        } else if (s[i] == '(' && depth > 0 && --depth == 0) {
+            s.erase(i);
+            break;
+        }
+    }
     return s;
 }
 
-/// True when an Itanium-mangled symbol belongs to the C++ standard library or
-/// a compiler runtime namespace: its outermost enclosing scope is `std` or
-/// `__gnu_cxx`.
-///
-/// The demangled name cannot answer this reliably: function templates demangle
-/// with their return type in front ("void std::__cxx11::basic_string<...>::
-/// _M_construct<...>"), which hides the namespace from a leading-"std::" test.
-/// The mangled name starts with the symbol's outermost scope instead: after
-/// "_Z" — and each "Z" of a local name, which is nested in its enclosing
-/// function's scope — a nested name "N" is followed by the first component.
-/// "St" is the abbreviation for namespace std; "__gnu_cxx" is its fully
-/// length-prefixed form. Anything not starting with "_Z" (C functions, LLVM
-/// intrinsics) is never a C++ namespace member.
+/// True when an Itanium-mangled symbol belongs to std:: or __gnu_cxx::.
+/// The demangled name cannot answer this: template instantiations demangle with
+/// a leading return type that hides the namespace. In the mangled name, after
+/// "_Z" (and each "Z" of a nested local name), "N" introduces the outermost
+/// scope: "St" stands for std, "9__gnu_cxx" for __gnu_cxx. Symbols not starting
+/// with "_Z" (C functions, LLVM intrinsics) are never namespace members.
 static bool isStdNamespaceMangled(const std::string& mangled) {
     if (mangled.rfind("_Z", 0) != 0) return false;
     size_t i = 2;
     while (i < mangled.size() && mangled[i] == 'Z') ++i;
     if (i < mangled.size() && mangled[i] == 'N') {
         ++i;
-        // <CV-qualifiers> / <ref-qualifier> sit between "N" and the first
-        // component for const/volatile/ref-qualified member functions.
+        // CV- and ref-qualifiers can precede the first nested-name component.
         while (i < mangled.size() && (mangled[i] == 'K' || mangled[i] == 'V' ||
                                       mangled[i] == 'r' || mangled[i] == 'R' ||
                                       mangled[i] == 'O'))
@@ -45,9 +60,9 @@ static bool isStdNamespaceMangled(const std::string& mangled) {
 }
 
 /// Lexically resolve ".", ".." and repeated separators in an absolute path so
-/// that prefix comparisons against the application's source tree are reliable
-/// (compilers emit paths like "/usr/lib/gcc/x86_64-linux-gnu/13/../../../../
-/// include/c++/13/bits/allocator.h"). Relative paths are returned unchanged.
+/// prefix comparisons against the application's source tree are reliable
+/// (compilers emit paths like "/usr/lib/gcc/.../13/../../../../include/c++/13").
+/// Relative paths are returned unchanged.
 static std::string normalizePath(const std::string& path) {
     if (path.empty() || path[0] != '/')
         return path;
@@ -75,9 +90,15 @@ static std::string normalizePath(const std::string& path) {
     return out.empty() ? "/" : out;
 }
 
-/// Join a DIFile's directory and filename into one path. Filenames emitted by
-/// clang are usually already absolute; the directory is prefixed only when the
-/// name is relative.
+/// True when \p file lies strictly below \p dir (directory boundary checked).
+static bool isUnderDir(const std::string& file, const std::string& dir) {
+    return file.size() > dir.size() &&
+           file.compare(0, dir.size(), dir) == 0 &&
+           file[dir.size()] == '/';
+}
+
+/// Join a DIFile's directory and filename. Clang usually emits absolute
+/// filenames; the directory is prefixed only for relative ones.
 static std::string joinPath(const std::string& dir, const std::string& name) {
     if (name.empty()) return {};
     if (name[0] == '/') return name;
@@ -86,8 +107,8 @@ static std::string joinPath(const std::string& dir, const std::string& name) {
 }
 
 /// Parent directory of a path; empty for "/" and for a bare file name. Works
-/// for relative paths too, so a compile unit recorded without an absolute
-/// directory still contributes its tree.
+/// for relative paths too, so a compile unit without an absolute directory
+/// still contributes its tree.
 static std::string parentDir(const std::string& path) {
     size_t slash = path.rfind('/');
     if (slash == std::string::npos || slash == 0)
@@ -102,47 +123,37 @@ static std::string filePath(const llvm::DIFile* file) {
                                   file->getFilename().str()));
 }
 
-/// The analyzed application's own source tree, derived from the module's
-/// compile units. A function is application code when the file it is *defined*
-/// in lives under one of these directories; every other definition file — the
-/// libstdc++/glibc headers (gthr-default.h, bits/allocator.h), or C/C++ library
-/// sources linked into the module — is library code. This decides library
-/// membership from where the code comes from, instead of listing library
-/// function names.
-///
+/// The application's source tree, derived from the module's compile units: a
+/// function is application code when the file it is *defined* in lives under
+/// one of these directories; headers and C/C++ library sources linked into the
+/// module are library code. This decides membership by origin, not by name.
 /// Each compile unit contributes its own directory and its parent, so headers
-/// kept beside the sources (include/, ../include) remain application code.
+/// kept beside the sources (include/, ../include) stay application code.
 /// Without debug info there are no compile units: the tree is empty and the
-/// classifier falls back to the body/namespace checks.
+/// classifier falls back to system-header detection.
 static std::vector<std::string> buildAppSourceDirs(const llvm::Module& M) {
     std::vector<std::string> dirs;
     for (const llvm::DICompileUnit* cu : M.debug_compile_units()) {
         const llvm::DIFile* file = cu ? cu->getFile() : nullptr;
         if (!file) continue;
-        const std::string dir = parentDir(filePath(file));
-        if (dir.empty() || dir == "/") continue;
-        dirs.push_back(dir);
-        const std::string parent = parentDir(dir);
-        if (!parent.empty() && parent != "/")
-            dirs.push_back(parent);
+        // The compile unit's directory and its parent.
+        std::string dir = parentDir(filePath(file));
+        for (int level = 0; level < 2 && !dir.empty() && dir != "/"; ++level) {
+            dirs.push_back(dir);
+            dir = parentDir(dir);
+        }
     }
     std::sort(dirs.begin(), dirs.end());
     dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
     return dirs;
 }
 
-/// Name-based, debug-info-independent part of the exclusion test. It covers the
-/// symbols whose *namespace* identifies them as library code; everything else
-/// (in particular the C library, whose functions carry no namespace) is decided
-/// from the definition file by FunctionFilter::isExcluded.
-///  - the std:: and __gnu_cxx:: namespaces (decided from the mangled name, so
-///    return-type-prefixed template instantiations such as
-///    "void std::...::_M_construct<...>" are caught too);
-///  - the C++ runtime ABI and compiler runtime families (__cxa_*, __gxx_*,
-///    the _Unwind_ unwinder, sanitizer hooks);
-///  - the allocation operators and clang's terminate helper.
-/// User callbacks called from inside these (comparators, lambdas, functors)
-/// are still shown, grafted onto the caller that reached them.
+/// Debug-info-independent exclusion test: std::/__gnu_cxx:: symbols (read from
+/// the mangled name so return-type-prefixed template instantiations are caught),
+/// the C++ ABI, unwinder, sanitizer and hardening runtime families, and the
+/// allocation operators. The C library has no namespace and is classified by
+/// its definition file in isExcluded(). User callbacks reached from inside
+/// these functions are still reported.
 static bool isStdLibFunction(const std::string& mangled,
                              const std::string& demangled) {
     if (isStdNamespaceMangled(mangled)) return true;
@@ -164,29 +175,27 @@ static bool isStdLibFunction(const std::string& mangled,
            base == "operator delete" || base == "operator delete[]";
 }
 
-/// Fallback for the file test when the module has no compile units: Linux
-/// system include directories are all under /usr/. Used for call sites and as a
-/// last resort when no application tree could be derived.
+/// Fallback when the module has no compile units: Linux system headers all
+/// live under /usr/. Also used for call sites.
 bool isSystemHeaderFile(const std::string& file) {
-    if (file.empty() || file[0] != '/')
-        return false;
-    return file.rfind("/usr/", 0) == 0;
+    return isUnderDir(file, "/usr");
 }
 
-/// Compute a function's definition line range from its DISubprogram.
-/// The start line is the function signature line; the end line is the
-/// largest debug line among the function's own (non-inlined) instructions.
-/// Returns false when the bitcode has no debug info (not built with -g).
-static bool getFuncLineRange(const llvm::Function* F, FuncLineRange& range) {
-    const llvm::DISubprogram* sp = F->getSubprogram();
-    if (!sp) return false;
+/// Line range and definition file from a function's DISubprogram. The start
+/// line is the signature; the end line is the largest debug line among the
+/// function's own (non-inlined) instructions. hasInfo stays false when the
+/// bitcode has no debug info (not built with -g).
+static FuncLineRange getFuncLineRange(const llvm::Function& F) {
+    FuncLineRange range;
+    const llvm::DISubprogram* sp = F.getSubprogram();
+    if (!sp) return range;
 
     range.file = sp->getFilename().str();
     range.defFile = filePath(sp->getFile());
     range.start = sp->getLine();
     range.end = range.start;
 
-    for (const llvm::BasicBlock& bb : *F) {
+    for (const llvm::BasicBlock& bb : F) {
         for (const llvm::Instruction& inst : bb) {
             const llvm::DILocation* loc = inst.getDebugLoc();
             if (!loc || loc->getInlinedAt()) continue; // skip inlined callee code
@@ -194,24 +203,24 @@ static bool getFuncLineRange(const llvm::Function* F, FuncLineRange& range) {
         }
     }
     range.hasInfo = true;
-    return true;
+    return range;
 }
 
 FunctionFilter FunctionFilter::build(
     const llvm::Module& M, const std::vector<std::string>& namePatterns) {
     FunctionFilter filter;
     for (const llvm::Function& F : M) {
-        FuncLineRange range;
-        if (getFuncLineRange(&F, range))
-            filter.lineRanges_[F.getName().str()] = range;
+        const std::string name = F.getName().str();
+        FuncLineRange range = getFuncLineRange(F);
+        if (range.hasInfo)
+            filter.lineRanges_[name] = std::move(range);
         if (F.isDeclaration())
-            filter.externalDecls_.insert(F.getName().str());
+            filter.externalDecls_.insert(name);
     }
     filter.appDirs_ = buildAppSourceDirs(M);
 
-    // User filter file: one ECMAScript regex per line. A malformed expression is
-    // a configuration error, not a reason to abort the analysis, so it is
-    // reported and skipped.
+    // One ECMAScript regex per line; a malformed expression is a configuration
+    // error, not a reason to abort the analysis, so report and skip it.
     filter.namePatterns_.reserve(namePatterns.size());
     for (const std::string& pattern : namePatterns) {
         try {
@@ -226,59 +235,43 @@ FunctionFilter FunctionFilter::build(
     return filter;
 }
 
-bool FunctionFilter::inAppTree(const std::string& file) const {
-    if (file.empty()) return false;
+/// Definition-site classification shared by isExcluded() and isAppFunction():
+/// true for library code, false for application code, nullopt when this symbol
+/// has no debug info in the module (the caller then decides from whether the
+/// module carries debug info elsewhere).
+std::optional<bool> FunctionFilter::libraryByDefinition(
+    const std::string& mangled) const {
+    // Body-less: only a declaration in this module. The application's own code
+    // is compiled into the bitcode, so a missing definition means library code.
+    if (externalDecls_.count(mangled)) return true;
+    auto it = lineRanges_.find(mangled);
+    if (it == lineRanges_.end()) return std::nullopt;
+    if (appDirs_.empty()) return isSystemHeaderFile(it->second.defFile);
     for (const std::string& dir : appDirs_)
-        if (file.size() > dir.size() &&
-            file.compare(0, dir.size(), dir) == 0 &&
-            file[dir.size()] == '/')
-            return true;
-    return false;
+        if (isUnderDir(it->second.defFile, dir)) return false;
+    return true;
 }
 
 bool FunctionFilter::isExcluded(const std::string& mangled,
                                 const std::string& demangled) const {
     if (isStdLibFunction(mangled, demangled))
         return true;
-    // Body-less: only a declaration in this module. The application's own code
-    // is compiled into the bitcode, so a missing definition means library code.
-    if (externalDecls_.count(mangled))
-        return true;
-    auto it = lineRanges_.find(mangled);
-    if (it != lineRanges_.end()) {
-        // Defined in this module: application code iff its definition file is
-        // part of the application's own sources. A definition anywhere else is
-        // library code compiled into the module.
-        if (appDirs_.empty())
-            return isSystemHeaderFile(it->second.defFile);
-        return !inAppTree(it->second.defFile);
-    }
-    // No debug info for this function: it is library/runtime code (libc,
-    // LLVM intrinsics, RTTI), not part of the analyzed program's own sources.
-    // Only exclude when the module does carry debug info elsewhere — otherwise
-    // the program was built without -g and nothing is attributable.
-    return !lineRanges_.empty();
+    // No debug info for this symbol: library/runtime code when the module does
+    // carry debug info elsewhere; unattributable when built without -g.
+    return libraryByDefinition(mangled).value_or(!lineRanges_.empty());
 }
 
-/// Same definition-site test as isExcluded, stated positively: a function is
-/// application code when it is defined (not merely declared) in one of the
-/// compile units' source trees. Used to protect user callbacks from the
+/// Positive form of the definition-site test: protects user callbacks from the
 /// system-header call-site heuristic, which would otherwise hide a callback
 /// invoked from out-of-line library code.
 bool FunctionFilter::isAppFunction(const std::string& mangled) const {
-    if (externalDecls_.count(mangled)) return false;
-    auto it = lineRanges_.find(mangled);
-    if (it == lineRanges_.end()) return false;  // no debug info: unattributable
-    if (appDirs_.empty())
-        return !isSystemHeaderFile(it->second.defFile);
-    return inAppTree(it->second.defFile);
+    const std::optional<bool> library = libraryByDefinition(mangled);
+    return library && !*library;
 }
 
-/// Substring regex match against every name the function is known by: the
-/// demangled signature, the demangled name without parameters ("foo" for
-/// "foo(int)"), and the raw mangled symbol (so filters can target one overload).
-/// Avoiding a no-op second search when the two demangled forms coincide keeps
-/// the per-function cost at #patterns matches.
+/// Substring regex match against the demangled signature, the parameter-
+/// stripped name and the raw mangled symbol (so filters can target one
+/// overload). The second search is skipped when both demangled forms coincide.
 bool FunctionFilter::isFiltered(const std::string& mangled,
                                 const std::string& demangled) const {
     if (namePatterns_.empty()) return false;

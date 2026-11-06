@@ -71,22 +71,14 @@ add_executable(clang_analyzer src/main.cpp)
 target_link_libraries(clang_analyzer PRIVATE svfanalyzer)
 
 # ---------------------------------------------------------------------------
-# Class extractor: ./class_extractor [flags] <bitcode-file>
+# Class information tool: ./class_extractor [options] <input> [...]
 #
-# Reads the module's DWARF debug info directly through the LLVM API (no SVF
-# model is built), so it only needs libLLVM.
-# ---------------------------------------------------------------------------
-add_executable(class_extractor src/class_extractor.cpp)
-target_include_directories(class_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
-target_link_libraries(class_extractor PRIVATE "${LLVM_LIB}")
-set_target_properties(class_extractor PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
-
-# ---------------------------------------------------------------------------
-# Class dumper: ./class_dump [--all] <source> [...]
-#
-# Source-level extractor (classes, member functions, inheritance, overrides)
-# built on libclang's C API. It needs only clang-c headers + libclang.so --
-# no SVF and no libLLVM.
+# A single CLI entry point (class_cli.cpp) dispatches on the input file type:
+#   .bc / .ll         -> class_bitcode_extractor.cpp (LLVM IR DWARF debug info)
+#   C/C++ source      -> class_source_extractor.cpp  (libclang C API)
+# Both backends fill the same classinfo::ClassReport; class_report.cpp renders
+# it as JSON or text. The bitcode backend needs libLLVM, the source backend
+# needs libclang (neither needs SVF).
 # ---------------------------------------------------------------------------
 # Use the libclang from LLVM_PREFIX (not a cached find_library result, which
 # would go stale when LLVM_PREFIX changes); dev symlink first, soname second.
@@ -107,16 +99,30 @@ if(NOT CLANG_LIB)
     "or pass -DLLVM_PREFIX=<path>.")
 endif()
 
-add_executable(class_dump src/class_dump.cpp)
-target_compile_options(class_dump PRIVATE -Wall -Wextra)
-target_include_directories(class_dump SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
-target_link_libraries(class_dump PRIVATE "${CLANG_LIB}" ${CMAKE_DL_LIBS})
-set_target_properties(class_dump PROPERTIES BUILD_RPATH "${LLVM_PREFIX}/lib")
+add_executable(class_extractor
+    src/class_cli.cpp
+    src/class_report.cpp
+    src/class_bitcode_extractor.cpp
+    src/class_source_extractor.cpp)
+target_compile_options(class_extractor PRIVATE -Wall -Wextra)
+target_include_directories(class_extractor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(class_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+target_link_libraries(class_extractor PRIVATE
+    "${LLVM_LIB}" "${CLANG_LIB}" ${CMAKE_DL_LIBS})
+# libLLVM.so.21.1 is bundled in build/lib ($ORIGIN/lib); libclang.so is loaded
+# from the LLVM toolchain's lib directory.
+set_target_properties(class_extractor PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
 
 # ---------------------------------------------------------------------------
 # Native test program (builds with the default host compiler; no SVF).
 # ---------------------------------------------------------------------------
 add_executable(test_complex tests/test_complex.cpp)
+
+# The web-service fixture is a real HTTP/1.1 server:
+#   ./test_web_service [port] [max-requests]   (max-requests 0 = forever)
+add_executable(test_web_service tests/test_web_service.cpp)
 
 # ---------------------------------------------------------------------------
 # Test-program bitcode, produced with the LLVM-21 toolchain (the system clang
@@ -140,9 +146,18 @@ add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_prog.bc"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prog.c"
     COMMENT "Compiling tests/test_prog.c to LLVM bitcode")
 
+add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_web_service.bc"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${TEST_BITCODE_DIR}"
+    COMMAND "${LLVM_PREFIX}/bin/clang++" -std=c++17 -O0 -g -emit-llvm -c
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_service.cpp"
+            -o "${TEST_BITCODE_DIR}/test_web_service.bc"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_service.cpp"
+    COMMENT "Compiling tests/test_web_service.cpp to LLVM bitcode")
+
 add_custom_target(bitcode ALL DEPENDS
     "${TEST_BITCODE_DIR}/test_complex.bc"
-    "${TEST_BITCODE_DIR}/test_prog.bc")
+    "${TEST_BITCODE_DIR}/test_prog.bc"
+    "${TEST_BITCODE_DIR}/test_web_service.bc")
 
 # ---------------------------------------------------------------------------
 # Deployable runtime (self-contained; no LD_LIBRARY_PATH needed on the target)
@@ -189,6 +204,7 @@ add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
 
 # class_extractor resolves libLLVM through its $ORIGIN/lib rpath.
 add_dependencies(class_extractor runtime-libs)
+# Source inputs are handled by the same binary through its libclang rpath.
 
 # Assemble a clean self-contained deployment folder: clang_analyzer + lib/.
 add_custom_target(deploy
@@ -210,3 +226,21 @@ add_custom_target(analyze
     COMMAND "$<TARGET_FILE:clang_analyzer>" "${TEST_BITCODE_DIR}/test_complex.bc"
     DEPENDS clang_analyzer bitcode runtime-libs
     COMMENT "Run clang_analyzer on test_complex.bc (default config)")
+
+# ---------------------------------------------------------------------------
+# Regression tests (CTest): end-to-end assertions on the CLI, report layouts,
+# library-code classification and filter handling. The driver compiles its own
+# bitcode fixtures, so `ctest` needs no setup beyond a normal build.
+# ---------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  enable_testing()
+  add_test(NAME analyzer_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression_test.py"
+              --analyzer "$<TARGET_FILE:clang_analyzer>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+              --clang "${LLVM_PREFIX}/bin/clang"
+              --clangxx "${LLVM_PREFIX}/bin/clang++")
+  set_tests_properties(analyzer_regression PROPERTIES TIMEOUT 600)
+endif()

@@ -1,8 +1,9 @@
 //===----------------------------------------------------------------------===//
-// class_extractor — extract every class, its member functions and its
-// inheritance relationships from a C/C++ LLVM bitcode module.
+// class_bitcode_extractor.cpp — bitcode backend of the class-information tool.
 //
-// The information comes from the module's DWARF debug info (compile with -g):
+// Extracts every class, its member functions, fields and inheritance
+// relationships from a C/C++ LLVM bitcode module's DWARF debug info (compile
+// with -g):
 //   * a class is a DICompositeType tagged DW_TAG_class_type,
 //     DW_TAG_structure_type or DW_TAG_union_type that has a definition;
 //   * a base class is a DIDerivedType tagged DW_TAG_inheritance inside the
@@ -15,8 +16,11 @@
 // libstdc++/glibc headers, other library code linked into the module) are
 // hidden by default; --include-library keeps them.
 //
-// Usage: class_extractor [options] <bitcode-file>
+// The CLI (class_cli.cpp) dispatches .bc/.ll inputs here and writes the
+// resulting classinfo::ClassReport itself.
 //===----------------------------------------------------------------------===//
+
+#include "class_report.h"
 
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/BasicBlock.h>
@@ -28,66 +32,18 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/raw_ostream.h>
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+using namespace classinfo;
+
 namespace {
-
-// ---------------------------------------------------------------------------
-// Report data model
-// ---------------------------------------------------------------------------
-
-struct BaseInfo {
-    std::string name;       ///< display name of the base class (qualified)
-    std::string access;     ///< public / protected / private
-    bool isVirtual = false; ///< virtual inheritance
-    uint64_t offsetBits = 0;
-};
-
-struct FieldInfo {
-    std::string name;
-    std::string type;
-    std::string access;
-    bool isStatic = false;
-    uint64_t offsetBits = 0;
-};
-
-struct MethodInfo {
-    std::string name;        ///< simple name ("speak", "operator()", "~Dog")
-    std::string params;      ///< parameter list without parentheses
-    std::string signature;   ///< "void speak(int) const"-style rendering
-    std::string linkageName; ///< mangled symbol, empty for pure declarations
-    std::string access;
-    std::string file;
-    unsigned line = 0;
-    bool isVirtual = false;
-    bool isPureVirtual = false;
-    bool isStatic = false;
-    bool isDefinition = false;
-};
-
-struct ClassInfo {
-    std::string qualifiedName;
-    std::string kind; ///< class / struct / union
-    std::string file; ///< definition file as written in the debug info
-    std::string path; ///< normalized absolute definition path (filtering)
-    unsigned line = 0;
-    bool hasDefinition = false;
-    std::vector<BaseInfo> bases;
-    std::vector<FieldInfo> fields;
-    std::vector<MethodInfo> methods;
-};
 
 // ---------------------------------------------------------------------------
 // Path helpers (same normalization rules as the call-graph reporter)
@@ -345,14 +301,6 @@ std::string accessString(const NodeT* node, bool defaultPublic) {
     return defaultPublic ? "public" : "private";
 }
 
-/// "<access> [virtual ]<name>" for an inheritance entry.
-std::string baseClause(const BaseInfo& base) {
-    std::string out = base.access;
-    if (base.isVirtual) out += " virtual";
-    out += " " + base.name;
-    return out;
-}
-
 // ---------------------------------------------------------------------------
 // Extraction
 // ---------------------------------------------------------------------------
@@ -422,7 +370,7 @@ public:
 
         std::sort(classes_.begin(), classes_.end(),
                   [](const ClassInfo& a, const ClassInfo& b) {
-                      return a.qualifiedName < b.qualifiedName;
+                      return a.name < b.name;
                   });
         for (ClassInfo& cls : classes_) {
             std::sort(cls.methods.begin(), cls.methods.end(),
@@ -505,7 +453,7 @@ private:
         }
 
         ClassInfo cls;
-        cls.qualifiedName = qname;
+        cls.name = qname;
         cls.kind = kindName(type->getTag());
         cls.file = type->getFilename().str();
         cls.path = filePath(type->getFile());
@@ -606,7 +554,7 @@ private:
         if (llvm::DISubroutineType* ft = sp->getType())
             subroutineParts(ft, ret, method.params, 0);
         // Constructors and destructors have no return type in C++.
-        const std::string& qualified = cls.qualifiedName;
+        const std::string& qualified = cls.name;
         const size_t scopeEnd = qualified.rfind("::");
         std::string simple =
             scopeEnd == std::string::npos ? qualified
@@ -638,348 +586,43 @@ private:
     std::unordered_map<std::string, size_t> byName_;
 };
 
-// ---------------------------------------------------------------------------
-// Report writers
-// ---------------------------------------------------------------------------
-
-std::string jsonEscape(const std::string& in) {
-    std::string out;
-    out.reserve(in.size() + 8);
-    for (const char c : in) {
-        switch (c) {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(c) < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x",
-                              static_cast<unsigned>(c));
-                out += buf;
-            } else {
-                out += c;
-            }
-        }
-    }
-    return out;
-}
-
-const char* boolText(bool value) { return value ? "true" : "false"; }
-
-void writeTextReport(llvm::raw_ostream& os, const std::string& bcFile,
-                     const std::vector<ClassInfo>& classes,
-                     size_t hiddenClasses, bool hasDebugInfo) {
-    size_t methodCount = 0;
-    size_t baseCount = 0;
-    for (const ClassInfo& cls : classes) {
-        methodCount += cls.methods.size();
-        baseCount += cls.bases.size();
-    }
-
-    os << "#bitcode " << bcFile << "\n";
-    if (!hasDebugInfo)
-        os << "#warning no_debug_info: the module carries no DWARF debug "
-              "info; recompile with -g to extract classes\n";
-    os << "#classes " << classes.size() << " methods " << methodCount
-       << " inheritance_edges " << baseCount << "\n";
-    if (hiddenClasses > 0)
-        os << "#hidden_library_classes " << hiddenClasses
-           << " (use --include-library to keep them)\n";
-    os << "\n";
-
-    for (const ClassInfo& cls : classes) {
-        os << cls.kind << " " << cls.qualifiedName;
-        if (!cls.bases.empty()) {
-            os << " : ";
-            for (size_t i = 0; i < cls.bases.size(); ++i) {
-                if (i > 0) os << ", ";
-                os << baseClause(cls.bases[i]);
-            }
-        }
-        if (!cls.hasDefinition) os << " (declaration)";
-        os << " {\n";
-        os << "  # " << (cls.file.empty() ? "<no file>" : cls.file) << ":"
-           << cls.line << "\n";
-
-        for (const FieldInfo& field : cls.fields) {
-            os << "  ";
-            if (field.isStatic) os << "static ";
-            os << field.type << " " << field.name << "  [" << field.access;
-            if (!field.isStatic)
-                os << ", offset " << field.offsetBits << " bits";
-            os << "]\n";
-        }
-        if (!cls.fields.empty() && !cls.methods.empty()) os << "\n";
-
-        for (const MethodInfo& method : cls.methods) {
-            os << "  ";
-            if (method.isStatic) os << "static ";
-            if (method.isVirtual) os << "virtual ";
-            os << method.signature;
-            if (method.isPureVirtual) os << " = 0";
-            os << "  [" << method.access;
-            if (method.isDefinition)
-                os << ", definition";
-            else
-                os << ", declaration";
-            if (!method.linkageName.empty())
-                os << ", " << method.linkageName;
-            os << "]";
-            if (!method.file.empty())
-                os << "  " << method.file << ":" << method.line;
-            os << "\n";
-        }
-        os << "}\n\n";
-    }
-
-    if (!classes.empty()) {
-        os << "[inheritance]\n";
-        for (const ClassInfo& cls : classes) {
-            for (const BaseInfo& base : cls.bases) {
-                os << cls.qualifiedName << " -> " << base.name << "  ["
-                   << base.access;
-                if (base.isVirtual) os << ", virtual";
-                os << "]\n";
-            }
-        }
-    }
-}
-
-void writeJsonReport(llvm::raw_ostream& os, const std::string& bcFile,
-                     const std::vector<ClassInfo>& classes,
-                     size_t hiddenClasses, bool hasDebugInfo) {
-    os << "{\n";
-    os << "  \"bitcode\": \"" << jsonEscape(bcFile) << "\",\n";
-    os << "  \"debug_info\": " << boolText(hasDebugInfo) << ",\n";
-    os << "  \"hidden_library_classes\": " << hiddenClasses << ",\n";
-    os << "  \"classes\": [";
-    for (size_t ci = 0; ci < classes.size(); ++ci) {
-        const ClassInfo& cls = classes[ci];
-        os << (ci == 0 ? "\n" : ",\n");
-        os << "    {\n";
-        os << "      \"name\": \"" << jsonEscape(cls.qualifiedName) << "\",\n";
-        os << "      \"kind\": \"" << cls.kind << "\",\n";
-        os << "      \"file\": \"" << jsonEscape(cls.file) << "\",\n";
-        os << "      \"line\": " << cls.line << ",\n";
-        os << "      \"definition\": " << boolText(cls.hasDefinition) << ",\n";
-
-        os << "      \"bases\": [";
-        for (size_t i = 0; i < cls.bases.size(); ++i) {
-            const BaseInfo& base = cls.bases[i];
-            os << (i == 0 ? "\n" : ",\n");
-            os << "        {\"name\": \"" << jsonEscape(base.name)
-               << "\", \"access\": \"" << base.access
-               << "\", \"virtual\": " << boolText(base.isVirtual)
-               << ", \"offset_bits\": " << base.offsetBits << "}";
-        }
-        if (!cls.bases.empty()) os << "\n      ";
-        os << "],\n";
-
-        os << "      \"fields\": [";
-        for (size_t i = 0; i < cls.fields.size(); ++i) {
-            const FieldInfo& field = cls.fields[i];
-            os << (i == 0 ? "\n" : ",\n");
-            os << "        {\"name\": \"" << jsonEscape(field.name)
-               << "\", \"type\": \"" << jsonEscape(field.type)
-               << "\", \"access\": \"" << field.access
-               << "\", \"static\": " << boolText(field.isStatic)
-               << ", \"offset_bits\": " << field.offsetBits << "}";
-        }
-        if (!cls.fields.empty()) os << "\n      ";
-        os << "],\n";
-
-        os << "      \"methods\": [";
-        for (size_t i = 0; i < cls.methods.size(); ++i) {
-            const MethodInfo& method = cls.methods[i];
-            os << (i == 0 ? "\n" : ",\n");
-            os << "        {\"name\": \"" << jsonEscape(method.name)
-               << "\", \"signature\": \"" << jsonEscape(method.signature)
-               << "\", \"linkage_name\": \"" << jsonEscape(method.linkageName)
-               << "\", \"access\": \"" << method.access
-               << "\", \"virtual\": " << boolText(method.isVirtual)
-               << ", \"pure_virtual\": " << boolText(method.isPureVirtual)
-               << ", \"static\": " << boolText(method.isStatic)
-               << ", \"definition\": " << boolText(method.isDefinition)
-               << ", \"file\": \"" << jsonEscape(method.file)
-               << "\", \"line\": " << method.line << "}";
-        }
-        if (!cls.methods.empty()) os << "\n      ";
-        os << "]\n";
-        os << "    }";
-    }
-    if (!classes.empty()) os << "\n  ";
-    os << "],\n";
-
-    // Flattened inheritance graph: one edge per (derived, base) pair, so
-    // consumers do not have to walk the per-class "bases" arrays.
-    os << "  \"inheritance\": [";
-    size_t edgeCount = 0;
-    for (const ClassInfo& cls : classes) {
-        for (const BaseInfo& base : cls.bases) {
-            os << (edgeCount == 0 ? "\n" : ",\n");
-            ++edgeCount;
-            os << "    {\"derived\": \"" << jsonEscape(cls.qualifiedName)
-               << "\", \"base\": \"" << jsonEscape(base.name)
-               << "\", \"access\": \"" << base.access
-               << "\", \"virtual\": " << boolText(base.isVirtual)
-               << ", \"offset_bits\": " << base.offsetBits << "}";
-        }
-    }
-    if (edgeCount > 0) os << "\n  ";
-    os << "]\n}\n";
-}
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-struct Config {
-    std::string bitcode;
-    std::string format = "json";
-    std::string output;
-    bool includeLibrary = false;
-};
-
-void printUsage(const char* prog) {
-    llvm::errs()
-        << "Usage: " << prog << " [options] <bitcode-file>\n"
-        << "Extract every class, its member functions, fields and base classes\n"
-        << "from a C/C++ LLVM bitcode file's DWARF debug info.\n\n"
-        << "The bitcode must be compiled with -g; without debug info there is no\n"
-        << "class information in the IR.\n\n"
-        << "Options:\n"
-        << "  --format <json|text>  Report layout [default: json]\n"
-        << "  --output <file>       Write the report to <file> [default: stdout]\n"
-        << "  --include-library     Keep classes defined outside the application's\n"
-        << "                        source tree (std::, libstdc++ headers, other\n"
-        << "                        linked library code) [default: hidden]\n"
-        << "  -h, --help            Show this help\n";
-}
-
-bool parseArgs(int argc, char** argv, Config& config) {
-    for (int i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        if (std::strcmp(arg, "--format") == 0 && i + 1 < argc) {
-            config.format = argv[++i];
-            if (config.format != "text" && config.format != "json") {
-                llvm::errs() << "[ERROR] unknown --format '" << config.format
-                             << "' (expected text or json)\n";
-                return false;
-            }
-        } else if (std::strcmp(arg, "--output") == 0 && i + 1 < argc) {
-            config.output = argv[++i];
-        } else if (std::strcmp(arg, "--include-library") == 0) {
-            config.includeLibrary = true;
-        } else if (std::strcmp(arg, "-h") == 0 ||
-                   std::strcmp(arg, "--help") == 0) {
-            printUsage(argv[0]);
-            std::exit(0);
-        } else if (arg[0] == '-' && arg[1] == '-') {
-            llvm::errs() << "[ERROR] unknown option: " << arg << "\n";
-            printUsage(argv[0]);
-            return false;
-        } else if (config.bitcode.empty()) {
-            config.bitcode = arg;
-        } else {
-            llvm::errs() << "[ERROR] more than one bitcode file given\n";
-            return false;
-        }
-    }
-    if (config.bitcode.empty()) {
-        printUsage(argv[0]);
-        return false;
-    }
-    return true;
-}
-
 } // namespace
 
-int main(int argc, char** argv) {
-    Config config;
-    if (!parseArgs(argc, argv, config))
-        return 1;
+namespace classinfo {
 
-    llvm::SMDiagnostic error;
+bool extractClassesFromBitcode(const ClassOptions& options, ClassReport& report,
+                               std::string& error) {
+    const std::string& input = options.inputs.front();
+    llvm::SMDiagnostic diagnostic;
     llvm::LLVMContext context;
     std::unique_ptr<llvm::Module> module =
-        llvm::parseIRFile(config.bitcode, error, context);
+        llvm::parseIRFile(input, diagnostic, context);
     if (!module) {
-        error.print("class_extractor", llvm::errs());
-        return 1;
+        error = input + ": " + diagnostic.getMessage().str();
+        return false;
     }
 
     // Without debug info there is nothing to extract, but that is a property of
-    // the input rather than a tool failure: warn clearly, emit an empty report
-    // and exit successfully.
-    const bool hasDebugInfo = !module->debug_compile_units().empty();
-    if (!hasDebugInfo)
-        llvm::errs() << "[WARN] " << config.bitcode
-                     << " carries no DWARF debug info; class information is\n"
-                        "       only present when the sources are compiled "
-                        "with -g.\n"
-                        "       Nothing to extract -- writing an empty report.\n";
+    // the input rather than a tool failure: report it and emit an empty report.
+    report.hasDebugInfo = !module->debug_compile_units().empty();
 
     ClassExtractor extractor(*module);
     extractor.run();
     std::vector<ClassInfo>& all = extractor.classes();
 
     const std::vector<std::string> appDirs = buildAppSourceDirs(*module);
-    std::vector<ClassInfo> classes;
-    size_t hiddenClasses = 0;
-    classes.reserve(all.size());
+    report.classes.reserve(all.size());
     for (ClassInfo& cls : all) {
         const bool isApp =
-            config.includeLibrary || appDirs.empty() || cls.path.empty() ||
+            options.includeLibrary || appDirs.empty() || cls.path.empty() ||
             inAppTree(appDirs, cls.path);
         if (!isApp) {
-            ++hiddenClasses;
+            ++report.hiddenClasses;
             continue;
         }
-        classes.push_back(std::move(cls));
+        report.classes.push_back(std::move(cls));
     }
-
-    std::string report;
-    llvm::raw_string_ostream out(report);
-    if (config.format == "json")
-        writeJsonReport(out, config.bitcode, classes, hiddenClasses,
-                        hasDebugInfo);
-    else
-        writeTextReport(out, config.bitcode, classes, hiddenClasses,
-                        hasDebugInfo);
-    out.flush();
-
-    if (config.output.empty()) {
-        llvm::outs() << report;
-        llvm::outs().flush();
-    } else {
-        std::ofstream file(config.output, std::ios::binary);
-        if (!file) {
-            llvm::errs() << "[ERROR] cannot open output file: " << config.output
-                         << "\n";
-            return 1;
-        }
-        file << report;
-        if (!file) {
-            llvm::errs() << "[ERROR] failed to write " << config.output << "\n";
-            return 1;
-        }
-    }
-
-    llvm::errs() << "[class_extractor] classes=" << classes.size();
-    size_t methodCount = 0;
-    size_t baseCount = 0;
-    for (const ClassInfo& cls : classes) {
-        methodCount += cls.methods.size();
-        baseCount += cls.bases.size();
-    }
-    llvm::errs() << " methods=" << methodCount << " inheritance_edges="
-                 << baseCount;
-    if (hiddenClasses > 0)
-        llvm::errs() << " hidden_library_classes=" << hiddenClasses;
-    if (!hasDebugInfo) llvm::errs() << " no_debug_info=1";
-    llvm::errs() << (config.includeLibrary ? " (library classes included)\n"
-                                           : "\n");
-    return 0;
+    return true;
 }
+
+} // namespace classinfo

@@ -631,12 +631,26 @@ void testLoopFuncPtrReassign() {
 void opFuncA() { printf("operator A\n"); }
 void opFuncB() { printf("operator B\n"); }
 
+struct Addable {
+    int value;
+
+    Addable operator+(const Addable& other) const {
+        opFuncA();
+        return Addable{value + other.value};
+    }
+
+    Addable operator*(int factor) const {
+        opFuncB();
+        return Addable{value * factor};
+    }
+};
+
 void testOperatorOverloadCall() {
-    // Test that overloaded operators ultimately call functions
-    int a = 10, b = 20;
-    int c = a + b;  // built-in operator, just generates a call to the operator
-    printf("op result: %d\n", c);
-    (void)c;
+    // User-defined operators produce real call edges (a built-in int + does not).
+    Addable a{10}, b{20};
+    Addable sum = a + b;
+    Addable scaled = sum * 2;
+    printf("op result: %d %d\n", sum.value, scaled.value);
 }
 
 // ===== 33. Ternary with function pointer inside struct =====
@@ -1320,6 +1334,18 @@ void testConstexprRuntime(int runtimeInput) {
     printf("square: %d\n", n);
 }
 
+// ===== Struct wrapping a function pointer, invoked via operator() =====
+struct CallableOps {
+    FuncPtr fn;
+
+    void operator()() const { fn(); }
+};
+
+void testCallableOps() {
+    CallableOps ops{calleeViaPtr};
+    ops();
+}
+
 // ===== Main =====
 int main() {
     directCall();
@@ -1356,6 +1382,7 @@ int main() {
     testNestedLambda();
     testLoopFuncPtrReassign();
     testOperatorOverloadCall();
+    testCallableOps();
     testStructDispatchTable();
     testStdInvoke();
     testMultiLevelVirtual();

@@ -22,9 +22,11 @@ struct SpanRecord {
 };
 
 /// Human-readable layout: each entry's call chain as an indented ASCII tree.
-/// Cell width is 4 columns (`│   `/`    ` for ancestors, `├── `/`└── ` for the
-/// node itself); the depth-1 level is indented because the root contributes a
-/// cell too, mirroring the topology examples in the README.
+/// Every span is labelled with its call mode (`[root]`, `[direct]` or
+/// `[indirect]`, plus `[cycle]` on back-edges), mirroring the TSV `kind`
+/// column. Cell width is 4 columns (`│   `/`    ` for ancestors, `├── `/`└── `
+/// for the node itself); the depth-1 level is indented because the root
+/// contributes a cell too, mirroring the topology examples in the README.
 class TreeSink final : public SpanSink {
 public:
     explicit TreeSink(std::ostream& os);

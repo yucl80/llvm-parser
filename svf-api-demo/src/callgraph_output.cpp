@@ -95,6 +95,10 @@ static const FuncInfo& getFuncInfo(const FunObjVar* func,
     info.mangled = func->getName();
     const std::string& demangled = demangleFuncName(info.mangled);
     info.function = stripParams(demangled);
+    // Never emit a nameless span: if a demangled form ever defeats the
+    // parameter-list stripping, fall back to the full demangled (or raw) name.
+    if (info.function.empty())
+        info.function = demangled.empty() ? info.mangled : demangled;
     if (const FuncLineRange* range = filter.findLineRange(info.mangled);
         range && range->hasInfo) {
         info.file = range->file;

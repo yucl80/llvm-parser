@@ -48,8 +48,14 @@ void TreeSink::renderNode(unsigned idx, const std::string& prefix, bool last,
     if (hasParent)
         os_ << (last ? "└── " : "├── ");
     os_ << r.info->function;
-    if (r.indirect)
-        os_ << " [indirect]";
+    // Label the call mode of every span, mirroring the TSV `kind` column.
+    // Root spans have no incoming edge; the rest are direct or indirect
+    // call edges. Only indirect calls used to carry a marker, which left the
+    // mode of ordinary calls invisible in the tree layout.
+    if (!r.hasParent)
+        os_ << " [root]";
+    else
+        os_ << (r.indirect ? " [indirect]" : " [direct]");
     if (r.cycle)
         os_ << " [cycle]";
     if (r.callLoc)

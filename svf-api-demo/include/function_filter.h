@@ -4,6 +4,7 @@
 #include <llvm/IR/Module.h>
 
 #include <map>
+#include <optional>
 #include <regex>
 #include <string>
 #include <unordered_set>
@@ -19,7 +20,10 @@ struct FuncLineRange {
     bool hasInfo = false;
 };
 
-/// Strip a trailing parameter list: "foo(int)" -> "foo".
+/// Strip the outermost parameter list of a demangled name, e.g.
+/// "foo(int)" -> "foo" and "operator()(int)" -> "operator()".
+/// Prefixes such as "(anonymous namespace)::" and nested parameter
+/// parentheses are preserved.
 std::string stripParams(std::string s);
 
 /// Fallback for the file test when the module has no compile units: Linux
@@ -83,8 +87,10 @@ public:
     const FuncLineRange* findLineRange(const std::string& mangled) const;
 
 private:
-    /// Whether \p file lies under one of the application's source directories.
-    bool inAppTree(const std::string& file) const;
+    /// Definition-site classification shared by isExcluded() and
+    /// isAppFunction(): true for library code, false for application code,
+    /// nullopt when this symbol has no debug info in the module.
+    std::optional<bool> libraryByDefinition(const std::string& mangled) const;
 
     std::map<std::string, FuncLineRange> lineRanges_;
     std::unordered_set<std::string> externalDecls_;

@@ -1,31 +1,19 @@
-/*
- * class_dump.cpp - dump C/C++ class structure with Clang (libclang C API).
- *
- * For every class/struct/union defined in the given source files it reports:
- *   - kind, qualified name, source location
- *   - direct base classes (access specifier + virtual inheritance)
- *   - member functions (access, signature, ctor/dtor/static/virtual/pure
- *     virtual/deleted/defaulted/template)
- *   - for each member function, whether it overrides base-class functions and
- *     the exact list of base functions it overrides
- *
- * Build with CMake (target defined in svf-api-demo/CMakeLists.txt):
- *
- *   cmake -S svf-api-demo -B build -DLLVM_PREFIX=/usr/lib/llvm-21
- *   cmake --build build --target class_dump
- *
- * Or compile directly (LLVM 21 with libclang-21-dev; -ldl is needed for the
- * builtin-header resource-dir lookup):
- *
- *   g++ -std=c++17 -O2 svf-api-demo/src/class_dump.cpp \
- *       -I/usr/lib/llvm-21/include \
- *       /usr/lib/llvm-21/lib/libclang.so \
- *       -o class_dump -Wl,-rpath,/usr/lib/llvm-21/lib -ldl
- *
- * Usage:
- *   ./class_dump <source> [more sources ...] [-- <extra clang args>]
- *   ./class_dump --all <source>     # also report classes from headers
- */
+//===----------------------------------------------------------------------===//
+// class_source_extractor.cpp — source backend of the class-information tool.
+//
+// Uses libclang's C API to report, for every class/struct/union defined in the
+// given source files:
+//   - kind, qualified name, source location
+//   - direct base classes (access specifier + virtual inheritance)
+//   - member functions (access, signature, ctor/dtor/static/virtual/pure
+//     virtual/deleted/defaulted/template)
+//   - for each member function, the base-class functions it overrides
+//
+// The CLI (class_cli.cpp) dispatches C/C++ source inputs here and writes the
+// resulting classinfo::ClassReport itself.
+//===----------------------------------------------------------------------===//
+
+#include "class_report.h"
 
 #include <clang-c/Index.h>
 
@@ -36,36 +24,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
+using namespace classinfo;
+
 namespace {
-
-//===----------------------------------------------------------------------===//
-// Result model
-//===----------------------------------------------------------------------===//
-
-struct BaseInfo {
-  std::string name;
-  std::string access;  // public / protected / private
-  bool isVirtual = false;
-};
-
-struct MethodInfo {
-  std::string signature;  // e.g. "virtual void speak() const"
-  std::string access;
-  std::string location;
-  std::string flags;                    // ctor, dtor, template, pure virtual, ...
-  std::vector<std::string> overridden;  // base functions this one overrides
-};
-
-struct ClassInfo {
-  std::string name;
-  std::string kind;  // class / struct / union / class template
-  std::string location;
-  std::vector<BaseInfo> bases;
-  std::vector<MethodInfo> methods;
-};
 
 //===----------------------------------------------------------------------===//
 // libclang helpers
@@ -136,6 +101,66 @@ std::string locationStr(CXCursor C) {
   return Name + ":" + std::to_string(Line);
 }
 
+/// Split libclang's "file:line" location into the shared report's fields.
+void splitLocation(const std::string &Loc, std::string &File, unsigned &Line) {
+  const size_t Colon = Loc.rfind(':');
+  if (Colon == std::string::npos) {
+    File = Loc;
+    return;
+  }
+  File = Loc.substr(0, Colon);
+  Line = static_cast<unsigned>(std::atoi(Loc.c_str() + Colon + 1));
+}
+
+/// libclang renders static/virtual and "= 0"/"= delete"/"= default" inside the
+/// signature. The shared model keeps those in dedicated fields so both
+/// backends produce the same signature shape ("void speak(int) const").
+std::string stripDecorators(const std::string &Signature) {
+  std::string Out = Signature;
+  for (bool Changed = true; Changed;) {
+    Changed = false;
+    for (const char *Prefix : {"static ", "virtual "}) {
+      const size_t Len = std::strlen(Prefix);
+      if (Out.compare(0, Len, Prefix) == 0) {
+        Out.erase(0, Len);
+        Changed = true;
+      }
+    }
+  }
+  for (const char *Suffix : {" = 0", " = delete", " = default"}) {
+    const size_t Len = std::strlen(Suffix);
+    if (Out.size() >= Len &&
+        Out.compare(Out.size() - Len, Len, Suffix) == 0) {
+      Out.erase(Out.size() - Len);
+      break;
+    }
+  }
+  return Out;
+}
+
+/// Parameter list of a signature, found by matching parentheses backwards so
+/// that "operator()" and function-pointer parameters are handled correctly.
+std::string parameterList(const std::string &Signature) {
+  const size_t Close = Signature.rfind(')');
+  if (Close == std::string::npos)
+    return std::string();
+  int Depth = 0;
+  size_t Open = std::string::npos;
+  for (size_t I = Close + 1; I-- > 0;) {
+    if (Signature[I] == ')') {
+      ++Depth;
+    } else if (Signature[I] == '(' && --Depth == 0) {
+      Open = I;
+      break;
+    }
+    if (I == 0)
+      break;
+  }
+  if (Open == std::string::npos || Close <= Open + 1)
+    return std::string();
+  return Signature.substr(Open + 1, Close - Open - 1);
+}
+
 /// "Base::foo(int) const" — enough to disambiguate overloads.
 std::string methodLabel(CXCursor M) {
   std::string S = scopePrefix(M) + toStd(clang_getCursorSpelling(M)) + "(";
@@ -158,7 +183,7 @@ std::string methodLabel(CXCursor M) {
 /// cursor without the templated CXXMethodDecl child, so the signature has to be
 /// rebuilt from the function prototype type ("void (T) const").
 ///
-/// Note: clang_CXXMethod_isVirtual()/isPurVirtual() and
+/// Note: clang_CXXMethod_isVirtual()/isPureVirtual() and
 /// clang_getOverriddenCursors() accept a CXXMethodDecl only, so the
 /// virtual/override relation of a member function *template* is not reported.
 std::string templateMethodSignature(CXCursor FT) {
@@ -315,20 +340,19 @@ private:
     CXCursorKind MethodKind = K;
 
     MethodInfo MI;
+    MI.name = toStd(clang_getCursorSpelling(M));
     MI.access = accessStr(clang_getCXXAccessSpecifier(M));
-    MI.location = locationStr(M);
-    if (IsTemplate) {
-      MI.signature = templateMethodSignature(M);
-      MethodKind = CXCursor_FunctionTemplate;
-    } else {
-      MI.signature = methodSignature(M, MethodKind);
-    }
+    splitLocation(locationStr(M), MI.file, MI.line);
+    MI.signature = stripDecorators(IsTemplate
+                                       ? templateMethodSignature(M)
+                                       : methodSignature(M, MethodKind));
+    MI.params = parameterList(MI.signature);
+    MI.isStatic = clang_CXXMethod_isStatic(M) != 0;
+    MI.isVirtual = clang_CXXMethod_isVirtual(M) != 0;
+    MI.isPureVirtual = clang_CXXMethod_isPureVirtual(M) != 0;
+    MI.isDefinition = clang_isCursorDefinition(M) != 0;
 
-    auto addFlag = [&MI](const char *Flag) {
-      if (!MI.flags.empty())
-        MI.flags += ", ";
-      MI.flags += Flag;
-    };
+    auto addFlag = [&MI](const char *Flag) { MI.flags.push_back(Flag); };
     if (IsTemplate)
       addFlag("template");
     if (MethodKind == CXCursor_Constructor)
@@ -374,7 +398,8 @@ private:
     Info.name = scopePrefix(C) + toStd(clang_getCursorDisplayName(C));
     if (Info.name.empty())
       Info.name = "(anonymous)";
-    Info.location = locationStr(C);
+    splitLocation(locationStr(C), Info.file, Info.line);
+    Info.hasDefinition = clang_isCursorDefinition(C) != 0;
 
     switch (clang_getCursorKind(C)) {
     case CXCursor_StructDecl:
@@ -409,86 +434,8 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
-// Reporting
+// Translation-unit parsing
 //===----------------------------------------------------------------------===//
-
-void printReport(const std::vector<ClassInfo> &Classes) {
-  size_t MethodCount = 0, OverrideCount = 0, EdgeCount = 0;
-
-  for (const ClassInfo &C : Classes) {
-    std::printf("### %s %s\n", C.kind.c_str(), C.name.c_str());
-    std::printf("    file      %s\n", C.location.c_str());
-
-    if (C.bases.empty()) {
-      std::printf("    bases     (none)\n");
-    } else {
-      std::printf("    bases\n");
-      for (const BaseInfo &B : C.bases) {
-        std::printf("      - %s%s%s\n", B.access.c_str(),
-                    B.isVirtual ? " virtual " : " ", B.name.c_str());
-        ++EdgeCount;
-      }
-    }
-
-    if (C.methods.empty()) {
-      std::printf("    methods   (none)\n");
-      std::printf("\n");
-      continue;
-    }
-
-    std::printf("    methods (%zu)\n", C.methods.size());
-    for (const MethodInfo &M : C.methods) {
-      ++MethodCount;
-      std::printf("      - [%s] %s", M.access.c_str(), M.signature.c_str());
-      if (!M.flags.empty())
-        std::printf("  [%s]", M.flags.c_str());
-      std::printf("\n");
-      std::printf("          at %s\n", M.location.c_str());
-      if (!M.overridden.empty()) {
-        ++OverrideCount;
-        std::printf("          overrides:");
-        for (const std::string &O : M.overridden)
-          std::printf(" %s;", O.c_str());
-        std::printf("\n");
-      }
-    }
-    std::printf("\n");
-  }
-
-  std::printf("=== summary ===\n");
-  std::printf("classes: %zu  member functions: %zu  overriding functions: %zu  "
-              "base edges: %zu\n",
-              Classes.size(), MethodCount, OverrideCount, EdgeCount);
-  for (const ClassInfo &C : Classes) {
-    if (C.bases.empty())
-      continue;
-    std::printf("  %s", C.name.c_str());
-    for (size_t I = 0; I < C.bases.size(); ++I) {
-      const BaseInfo &B = C.bases[I];
-      std::printf("%s %s%s%s", I == 0 ? " ->" : ",", B.access.c_str(),
-                  B.isVirtual ? " virtual " : " ", B.name.c_str());
-    }
-    std::printf("\n");
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Driver
-//===----------------------------------------------------------------------===//
-
-void printUsage(const char *Argv0) {
-  std::fprintf(stderr,
-               "usage: %s [--all] <source> [more sources ...] "
-               "[-- <extra clang args>]\n"
-               "\n"
-               "  --all   also report classes defined in headers (system "
-               "headers are always skipped)\n"
-               "  --      everything after it is passed to clang verbatim\n"
-               "\n"
-               "Reports classes, member functions, base classes and the "
-               "override relation.\n",
-               Argv0);
-}
 
 bool hasArg(const std::vector<std::string> &Args, const char *Prefix) {
   for (const std::string &A : Args)
@@ -597,54 +544,43 @@ CXTranslationUnit parse(const std::string &Path, bool IsC,
 
 }  // namespace
 
-int main(int argc, char **argv) {
-  std::vector<std::string> Sources;
-  std::vector<std::string> ExtraArgs;
-  bool AllHeaders = false;
-  bool AfterDashDash = false;
+namespace classinfo {
 
-  for (int I = 1; I < argc; ++I) {
-    std::string A = argv[I];
-    if (AfterDashDash) {
-      ExtraArgs.push_back(A);
-    } else if (A == "--") {
-      AfterDashDash = true;
-    } else if (A == "--all" || A == "-a") {
-      AllHeaders = true;
-    } else if (A == "-h" || A == "--help") {
-      printUsage(argv[0]);
-      return 0;
-    } else {
-      Sources.push_back(A);
-    }
-  }
+bool extractClassesFromSource(const ClassOptions &options, ClassReport &report,
+                              std::string &error) {
+  Collector collector(options.allHeaders);
+  std::vector<std::string> Failed;
 
-  if (Sources.empty()) {
-    printUsage(argv[0]);
-    return 1;
-  }
-
-  Collector Col(AllHeaders);
-  int Failures = 0;
-
-  for (const std::string &Src : Sources) {
+  for (const std::string &Src : options.inputs) {
     std::string Ext = extensionOf(Src);
     bool IsC = Ext == ".c";
     bool IsHeader = isCFamilyHeader(Ext);
     // A .h file is treated as C only when the user says so with -x c.
-    bool HeaderAsC = IsHeader && hasArg(ExtraArgs, "-x") &&
-                     std::find(ExtraArgs.begin(), ExtraArgs.end(), "c") !=
-                         ExtraArgs.end();
+    bool HeaderAsC = IsHeader && hasArg(options.clangArgs, "-x") &&
+                     std::find(options.clangArgs.begin(),
+                               options.clangArgs.end(), "c") !=
+                         options.clangArgs.end();
 
-    CXTranslationUnit TU = parse(Src, IsC || HeaderAsC, ExtraArgs);
+    CXTranslationUnit TU = parse(Src, IsC || HeaderAsC, options.clangArgs);
     if (!TU) {
-      ++Failures;
+      Failed.push_back(Src);
       continue;
     }
-    Col.collect(TU);
+    collector.collect(TU);
     clang_disposeTranslationUnit(TU);
   }
 
-  printReport(Col.Classes);
-  return Failures ? 2 : 0;
+  report.classes = std::move(collector.Classes);
+  if (!Failed.empty()) {
+    error = "cannot parse source file(s): ";
+    for (size_t I = 0; I < Failed.size(); ++I) {
+      if (I > 0)
+        error += ", ";
+      error += Failed[I];
+    }
+    return false;
+  }
+  return true;
 }
+
+}  // namespace classinfo
