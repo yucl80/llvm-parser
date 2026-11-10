@@ -85,8 +85,11 @@ overrides, function-pointer tables, lambdas / `std::function`, format templates,
 custom APIs and dynamic SQL. Its `runDynamicSql()` function adds six run-time
 SQL-assembly shapes — `operator+` with a parameter, `+=` with `std::to_string`,
 an `append()` chain, `std::ostringstream`, `snprintf` into a stack buffer and a
-loop-accumulated predicate. Both back ends must report these as `dynamic` with
-no fabricated SQL, as they are the classic SQL-injection patterns.
+loop-accumulated predicate. The source extractor reports their known SQL
+structure as incomplete templates, marking unknown runtime values as
+`<dynamic>`; the `.sql` report comments these templates out so they cannot be
+mistaken for executable statements. Inputs with no recoverable SQL structure
+remain `dynamic`.
 `svf-api-demo/tests/sql_extractor_test.py` is its CTest regression suite
 (`sql_extractor_regression`).
 

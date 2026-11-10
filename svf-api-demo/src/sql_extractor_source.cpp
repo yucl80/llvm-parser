@@ -354,6 +354,25 @@ struct Value {
     bool complete = true;
 };
 
+void appendDynamicPart(Value &V) {
+    static const std::string Marker = "<dynamic>";
+    if (V.text.size() < Marker.size() ||
+        V.text.compare(V.text.size() - Marker.size(), Marker.size(), Marker) !=
+            0)
+        V.text += Marker;
+    V.complete = false;
+}
+
+bool hasSqlTemplate(const std::string &Text) {
+    std::string Candidate = Text;
+    size_t Pos = 0;
+    while ((Pos = Candidate.find("<dynamic>", Pos)) != std::string::npos) {
+        Candidate.replace(Pos, 9, "value");
+        Pos += 5;
+    }
+    return looksLikeSql(Candidate);
+}
+
 bool isTransparent(CXCursorKind K) {
     switch (K) {
     case CXCursor_UnexposedExpr:
@@ -413,7 +432,8 @@ public:
     explicit Resolver(std::unordered_set<std::string> *Consumed)
         : Consumed_(Consumed) {}
 
-    bool eval(CXCursor C, Value &V, int Depth = 0) {
+    bool eval(CXCursor C, Value &V, int Depth = 0,
+              CXCursor Use = clang_getNullCursor()) {
         if (Depth > 32 || clang_Cursor_isNull(C))
             return false;
         const CXCursorKind K = clang_getCursorKind(C);
@@ -439,12 +459,12 @@ public:
             if (!clang_Cursor_isNull(Ref)) {
                 const CXCursorKind RK = clang_getCursorKind(Ref);
                 if (RK == CXCursor_VarDecl || RK == CXCursor_FieldDecl)
-                    return evalDecl(Ref, V, Depth + 1);
+                    return evalDecl(Ref, V, Depth + 1, Use);
             }
             // A member-call callee ("sql.c_str()") carries the object
             // expression as its child, invisible in getNumArguments().
             if (K == CXCursor_MemberRefExpr)
-                return evalChildren(C, V, Depth + 1);
+                return evalChildren(C, V, Depth + 1, Use);
             return false;
         }
 
@@ -455,23 +475,21 @@ public:
             for (int I = 0; I < NumArgs; ++I) {
                 CXCursor Arg = clang_Cursor_getArgument(C, static_cast<unsigned>(I));
                 Value Part;
-                if (eval(Arg, Part, Depth + 1)) {
+                if (eval(Arg, Part, Depth + 1, Use)) {
                     Acc.text += Part.text;
                     Acc.complete = Acc.complete && Part.complete;
                     Found = true;
                 } else if (unresolvedContributes(Arg)) {
-                    Acc.complete = false;
+                    appendDynamicPart(Acc);
                 }
             }
             if (!Found) {
                 // Wrapper conversions (std::string::c_str(), data(), ...)
-                // hold the SQL in the callee's object expression. Accept it
-                // only when the whole value is statically known.
+                // hold the SQL in the callee's object expression.
                 const std::vector<CXCursor> Kids = children(C);
                 if (!Kids.empty()) {
                     Value Object;
-                    if (eval(Kids.front(), Object, Depth + 1) &&
-                        Object.complete) {
+                    if (eval(Kids.front(), Object, Depth + 1, Use)) {
                         V = std::move(Object);
                         return true;
                     }
@@ -483,22 +501,141 @@ public:
         }
 
         if (isTransparent(K))
-            return evalChildren(C, V, Depth + 1);
+            return evalChildren(C, V, Depth + 1, Use);
         return false;
     }
 
 private:
-    bool evalChildren(CXCursor C, Value &V, int Depth) {
+    struct Mutation {
+        unsigned endOffset;
+        std::string text;
+    };
+
+    static unsigned cursorOffset(CXCursor C, bool End) {
+        CXSourceRange Range = clang_getCursorExtent(C);
+        CXSourceLocation Loc =
+            End ? clang_getRangeEnd(Range) : clang_getRangeStart(Range);
+        unsigned Offset = 0;
+        clang_getExpansionLocation(Loc, nullptr, nullptr, nullptr, &Offset);
+        return Offset;
+    }
+
+    static bool references(CXCursor C, CXCursor Decl, int Depth = 0) {
+        if (Depth > 32 || clang_Cursor_isNull(C))
+            return false;
+        if (clang_equalCursors(clang_getCursorReferenced(C), Decl))
+            return true;
+        for (CXCursor Child : children(C))
+            if (references(Child, Decl, Depth + 1))
+                return true;
+        return false;
+    }
+
+    static CXCursor enclosingFunction(CXCursor C) {
+        for (CXCursor Parent = clang_getCursorSemanticParent(C);
+             !clang_Cursor_isNull(Parent);
+             Parent = clang_getCursorSemanticParent(Parent))
+            if (isFunctionKind(clang_getCursorKind(Parent)))
+                return Parent;
+        return clang_getNullCursor();
+    }
+
+    void collectMutations(CXCursor C, CXCursor Decl, CXCursor Use,
+                          std::vector<Mutation> &Out, int Depth) {
+        if (Depth > 256 || clang_Cursor_isNull(C) ||
+            cursorOffset(C, false) >= cursorOffset(Use, false))
+            return;
+
+        const CXCursorKind K = clang_getCursorKind(C);
+        if (K == CXCursor_ForStmt || K == CXCursor_WhileStmt ||
+            K == CXCursor_DoStmt) {
+            std::vector<Mutation> Body;
+            for (CXCursor Child : children(C))
+                collectMutations(Child, Decl, Use, Body, Depth + 1);
+            if (!Body.empty())
+                Out.push_back({cursorOffset(C, true), "<dynamic>"});
+            return;
+        }
+        if (K == CXCursor_CompoundAssignOperator) {
+            const std::vector<CXCursor> Kids = children(C);
+            if (Kids.size() >= 2 && references(Kids.front(), Decl)) {
+                Value Part;
+                if (!eval(Kids.back(), Part, 0, Use))
+                    appendDynamicPart(Part);
+                Out.push_back({cursorOffset(C, true), std::move(Part.text)});
+                return;
+            }
+        } else if (K == CXCursor_CallExpr) {
+            const std::string Name = toStd(clang_getCursorSpelling(C));
+            const int NumArgs = clang_Cursor_getNumArguments(C);
+            const std::vector<CXCursor> Kids = children(C);
+            if ((Name == "operator+=" || Name == "+=") && NumArgs == 2 &&
+                references(clang_Cursor_getArgument(C, 0), Decl)) {
+                Value Part;
+                if (!eval(clang_Cursor_getArgument(C, 1), Part, 0, Use))
+                    appendDynamicPart(Part);
+                Out.push_back({cursorOffset(C, true), std::move(Part.text)});
+                return;
+            }
+            if (Name == "append" && !Kids.empty() && NumArgs > 0 &&
+                references(Kids.front(), Decl)) {
+                for (int I = 0; I < NumArgs; ++I) {
+                    Value Part;
+                    CXCursor Arg =
+                        clang_Cursor_getArgument(C, static_cast<unsigned>(I));
+                    if (!eval(Arg, Part, 0, Use))
+                        appendDynamicPart(Part);
+                    Out.push_back(
+                        {cursorOffset(C, true), std::move(Part.text)});
+                }
+                return;
+            }
+            if ((Name == "operator<<" || Name == "<<") && NumArgs == 2 &&
+                references(clang_Cursor_getArgument(C, 0), Decl)) {
+                Value Part;
+                if (!eval(clang_Cursor_getArgument(C, 1), Part, 0, Use))
+                    appendDynamicPart(Part);
+                Out.push_back({cursorOffset(C, true), std::move(Part.text)});
+            }
+            if (Name == "snprintf" && NumArgs >= 3 &&
+                references(clang_Cursor_getArgument(C, 0), Decl)) {
+                Value Format;
+                if (eval(clang_Cursor_getArgument(C, 2), Format, 0, Use)) {
+                    size_t Pos = 0;
+                    while ((Pos = Format.text.find('%', Pos)) !=
+                           std::string::npos) {
+                        if (Pos + 1 < Format.text.size() &&
+                            std::isalpha(static_cast<unsigned char>(
+                                Format.text[Pos + 1]))) {
+                            Format.text.replace(Pos, 2, "<dynamic>");
+                            Pos += 9;
+                            Format.complete = false;
+                        } else {
+                            ++Pos;
+                        }
+                    }
+                    Out.push_back(
+                        {cursorOffset(C, true), std::move(Format.text)});
+                    return;
+                }
+            }
+        }
+
+        for (CXCursor Child : children(C))
+            collectMutations(Child, Decl, Use, Out, Depth + 1);
+    }
+
+    bool evalChildren(CXCursor C, Value &V, int Depth, CXCursor Use) {
         Value Acc;
         bool Found = false;
         for (CXCursor Child : children(C)) {
             Value Part;
-            if (eval(Child, Part, Depth + 1)) {
+            if (eval(Child, Part, Depth + 1, Use)) {
                 Acc.text += Part.text;
                 Acc.complete = Acc.complete && Part.complete;
                 Found = true;
             } else if (unresolvedContributes(Child)) {
-                Acc.complete = false;
+                appendDynamicPart(Acc);
             }
         }
         if (!Found)
@@ -507,13 +644,33 @@ private:
         return true;
     }
 
-    bool evalDecl(CXCursor Decl, Value &V, int Depth) {
+    bool evalDecl(CXCursor Decl, Value &V, int Depth, CXCursor Use) {
         const std::string Key = cursorKey(Decl);
         if (!Active_.insert(Key).second)
             return false; // self-referential initialiser
-        const bool Ok = evalChildren(Decl, V, Depth + 1);
+        Value Initial;
+        const bool HasInitial = evalChildren(Decl, Initial, Depth + 1, Use);
+        std::vector<Mutation> Mutations;
+        CXCursor Function = enclosingFunction(Decl);
+        if (!clang_Cursor_isNull(Function))
+            collectMutations(Function, Decl, Use, Mutations, 0);
         Active_.erase(Key);
-        return Ok;
+        if (Mutations.empty()) {
+            if (HasInitial)
+                V = std::move(Initial);
+            return HasInitial;
+        }
+
+        V = HasInitial ? std::move(Initial) : Value{};
+        std::stable_sort(Mutations.begin(), Mutations.end(),
+                         [](const Mutation &A, const Mutation &B) {
+                             return A.endOffset < B.endOffset;
+                         });
+        for (const Mutation &Part : Mutations) {
+            V.text += Part.text;
+            V.complete = false;
+        }
+        return true;
     }
 
     std::unordered_set<std::string> *Consumed_ = nullptr;
@@ -977,13 +1134,16 @@ private:
         // its literals visible to --scan-literals instead of hiding them.
         Location L = expansionLocation(Call);
         Value V;
-        if (Resolver_.eval(Arg, V, 0)) {
+        if (Resolver_.eval(Arg, V, 0, Call) &&
+            (V.complete || (Dispatch_ && hasSqlTemplate(V.text)))) {
             SqlStatement St = makeStatement(*Api, L);
             St.sql = std::move(V.text);
             St.complete = V.complete;
             if (Dispatch_ && hasFormatPlaceholder(St.sql)) {
                 St.origin = "format";
                 St.complete = false;
+            } else if (!St.complete) {
+                St.origin = "fragment";
             }
             Statements.push_back(std::move(St));
             return;

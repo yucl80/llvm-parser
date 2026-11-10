@@ -209,6 +209,22 @@ void writeSqlScript(std::string &Out, const SqlReport &Report) {
             continue;
         }
         std::string Text = St.sql;
+        if (!St.complete) {
+            Out += "-- Partial SQL template (not executable):\n";
+            size_t Begin = 0;
+            while (Begin <= Text.size()) {
+                const size_t End = Text.find('\n', Begin);
+                Out += "-- " + Text.substr(
+                                   Begin, End == std::string::npos
+                                              ? std::string::npos
+                                              : End - Begin) +
+                       "\n";
+                if (End == std::string::npos)
+                    break;
+                Begin = End + 1;
+            }
+            continue;
+        }
         while (!Text.empty() &&
                std::isspace(static_cast<unsigned char>(Text.back())))
             Text.pop_back();

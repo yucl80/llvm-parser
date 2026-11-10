@@ -133,7 +133,9 @@ class SimpleTest(unittest.TestCase):
 
         fragments = [s for s in statements if s["origin"] == "fragment"]
         self.assertEqual({s["sql"] for s in fragments},
-                         {"SELECT 1", "DELETE FROM users WHERE id = 2"})
+                         {"SELECT 1", "DELETE FROM users WHERE id = 2",
+                          "SELECT a FROM dispatch_table",
+                          "SELECT b FROM dispatch_table"})
         self.assertTrue(all(not s["complete"] for s in fragments))
 
     def test_provenance_present(self):
@@ -158,13 +160,24 @@ class SimpleTest(unittest.TestCase):
         self.assertIn("via schemaSql", out)
         self.assertIn("-- SQL argument is built at runtime", out)
 
-    def test_scan_literals_no_extra(self):
-        # Every SQL-looking literal is consumed by a call; --scan-literals must
-        # not duplicate or invent statements.
+    def test_scan_literals_preserves_call_reports(self):
+        # SQL-looking fragments used by runtime assembly are unconsumed
+        # literals, so scanning adds them without changing call reports.
         original = self.as_json()
         doc = self.as_json("--scan-literals")
-        self.assertEqual(doc["statements_total"],
-                         original["statements_total"])
+        scanned_calls = {
+            (s["origin"], s["api"], s["symbol"], s["sql"], s["line"])
+            for s in doc["statements"] if s["origin"] != "literal"
+        }
+        original_calls = {
+            (s["origin"], s["api"], s["symbol"], s["sql"], s["line"])
+            for s in original["statements"]
+        }
+        self.assertEqual(scanned_calls, original_calls)
+        literals = {s["sql"] for s in doc["statements"]
+                    if s["origin"] == "literal"}
+        self.assertIn("SELECT * FROM ", literals)
+        self.assertIn("SELECT name FROM %s WHERE id = %d", literals)
 
     def test_missing_input(self):
         proc = subprocess.run([self.EXTRACTOR, "--format", "json"],

@@ -149,13 +149,34 @@ def main():
         suite.check(len(assembled) == 6,
                     "fixture should contain 6 dynamic SQL assemblies, got %d"
                     % len(assembled))
-        suite.check(assembled <= dynamic_lines,
-                    "every runtime-assembled SQL must be reported as dynamic")
+        assembly_templates = {
+            s["line"]: s for s in statements
+            if s["line"] in assembled and s["origin"] == "fragment"
+        }
+        suite.check(assembled <= set(assembly_templates),
+                    "every dynamic assembly needs a partial SQL template")
+        expected_templates = {
+            156: "SELECT * FROM <dynamic>",
+            163: "DELETE FROM users WHERE id = <dynamic>",
+            171: "UPDATE users SET name = <dynamic> WHERE id = <dynamic>",
+            176: "INSERT INTO <dynamic> (id) VALUES (<dynamic>)",
+            182: "SELECT name FROM <dynamic> WHERE id = <dynamic>",
+            192: "SELECT id FROM poly WHERE <dynamic>",
+        }
+        suite.check(
+            {line: assembly_templates[line]["sql"]
+             for line in expected_templates if line in assembly_templates} ==
+            expected_templates,
+            "runtime assemblies must preserve static SQL templates")
+        suite.check(all(not assembly_templates[line]["complete"]
+                        for line in assembled if line in assembly_templates),
+                    "runtime SQL templates must be marked incomplete")
         suite.check(dynamic_lines - assembled == {99},
                     "the only other dynamic call is the bare `table` argument")
         suite.check(all(not s["sql"] and not s["complete"] for s in dynamic),
-                    "dynamic calls must carry no SQL text")
-        fragments = [s for s in statements if s["origin"] == "fragment"]
+                    "unresolved calls must carry no fabricated SQL text")
+        fragments = [s for s in statements
+                     if s["origin"] == "fragment" and s["line"] == 103]
         suite.check({s["sql"] for s in fragments} ==
                     {"SELECT 1", "DELETE FROM users WHERE id = 2"},
                     "conditional branches must be reported as static fragments")
@@ -177,6 +198,10 @@ def main():
                     "semicolon must follow the SQL, not trailing whitespace")
         suite.check("-- SQL argument is built at runtime" in script,
                     "dynamic calls must be documented")
+        suite.check("-- Partial SQL template (not executable):" in script and
+                    "-- SELECT * FROM <dynamic>" in script and
+                    "\nINSERT INTO <dynamic>" not in script,
+                    "partial SQL templates must be visible but not executable")
         suite.check(" via SqlBuilder::sql" in script and "[partial]" in script,
                     "script must document virtual candidates")
         out_file = work / "schema.sql"
