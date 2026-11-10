@@ -16,6 +16,30 @@ SVF-based call graph analysis tool that performs Andersen-style pointer analysis
 - **`svf-api-demo/CMakeLists.txt`** — CMake build (out-of-source into `build/`): builds the analyzer, the native test program, and the test bitcode.
 - **`svf-api-demo/build/clang_analyzer`** — Compiled analyzer binary (CMake build output).
 
+### Class Information
+
+One CLI (`build/class_extractor`) extracts classes, member functions, fields,
+bases and inheritance. Its input file type selects the backend:
+
+| Input | Backend |
+|-------|---------|
+| `.bc`, `.ll` (LLVM bitcode / textual IR, compiled with `-g`) | `src/class_bitcode_extractor.cpp` — DWARF debug info via the LLVM API |
+| `.c`, `.cpp`, `.h`, ... (C/C++ sources) | `src/class_source_extractor.cpp` — libclang C API |
+
+`src/class_cli.cpp` is the single entry point (type detection + dispatch),
+`include/class_report.h` / `src/class_report.cpp` hold the shared report model
+and the JSON/text writers. Extension-less inputs are classified by content;
+`--input-type bitcode|source` forces a backend.
+
+```bash
+./svf-api-demo/build/class_extractor --format json svf-api-demo/build/tests/test_complex.bc
+./svf-api-demo/build/class_extractor --format text svf-api-demo/tests/test_complex.cpp
+./svf-api-demo/build/class_extractor --all svf-api-demo/tests/test_complex.cpp -- -std=c++17
+```
+
+`--include-library` keeps non-application classes in bitcode reports;
+`--all` includes classes from (non-system) headers in source reports.
+
 ### Test Programs
 
 | File | Description |
@@ -304,8 +328,10 @@ written in both; the hiding rules and `--filter-file` apply identically.
 ### Tree Format (default)
 
 The default layout renders each entry's call chain as an indented ASCII tree:
-one line per span, `├──`/`└──` connectors with `│` verticals,
-`[indirect]`/`[cycle]` markers, and the call site in parentheses. The default
+one line per span, `├──`/`└──` connectors with `│` verticals, a call-mode
+marker (`[root]`, `[direct]` or `[indirect]`, plus `[cycle]` on recursion
+back-edges), and the call site in parentheses. The markers mirror the TSV
+`kind` column, so every span states how it was reached. The default
 output name is `<bitcode-stem>.callgraph.tree`:
 
 ```
@@ -314,10 +340,10 @@ output name is `<bitcode-stem>.callgraph.tree`:
 #analysis pta=FlowSensitive context_sensitive=1 heap_model=0 exclude_std=1
 #entries main
 ===== entry: main =====
-main
-    ├── foo  (tests/test_prog.c:6)
-    ├── bar  (tests/test_prog.c:7)
-    └── zoo  (tests/test_prog.c:8)
+main [root]
+    ├── foo [direct]  (tests/test_prog.c:6)
+    ├── bar [direct]  (tests/test_prog.c:7)
+    └── zoo [direct]  (tests/test_prog.c:8)
 ===== end: main spans=4 reachable=4 =====
 ```
 

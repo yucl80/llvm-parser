@@ -1,6 +1,7 @@
 # IDE / editor
-.vscode/
+#.vscode/
 
 # Top-level CMake scratch build dir
 # (svf-api-demo/build/ is ignored by svf-api-demo/.gitignore)
 build/
+*.tgz

@@ -71,6 +71,21 @@ add_executable(clang_analyzer src/main.cpp)
 target_link_libraries(clang_analyzer PRIVATE svfanalyzer)
 
 # ---------------------------------------------------------------------------
+# Bitcode entry-function lister: ./entry_extractor [options] <bitcode-file>
+# Standalone LLVM tool: parses the module with IRReader, no SVF needed.
+# function_filter.cpp supplies the DWARF-based app/library classification.
+# ---------------------------------------------------------------------------
+add_executable(entry_extractor
+    src/entry_extractor.cpp
+    src/function_filter.cpp)
+target_include_directories(entry_extractor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(entry_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+target_link_libraries(entry_extractor PRIVATE "${LLVM_LIB}")
+set_target_properties(entry_extractor PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
 # Class information tool: ./class_extractor [options] <input> [...]
 #
 # A single CLI entry point (class_cli.cpp) dispatches on the input file type:
@@ -202,8 +217,10 @@ foreach(lib IN LISTS RUNTIME_LIBS)
 endforeach()
 add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
 
-# class_extractor resolves libLLVM through its $ORIGIN/lib rpath.
+# class_extractor and entry_extractor resolve libLLVM through their
+# $ORIGIN/lib rpath.
 add_dependencies(class_extractor runtime-libs)
+add_dependencies(entry_extractor runtime-libs)
 # Source inputs are handled by the same binary through its libclang rpath.
 
 # Assemble a clean self-contained deployment folder: clang_analyzer + lib/.
@@ -243,4 +260,16 @@ if(Python3_Interpreter_FOUND)
               --clang "${LLVM_PREFIX}/bin/clang"
               --clangxx "${LLVM_PREFIX}/bin/clang++")
   set_tests_properties(analyzer_regression PROPERTIES TIMEOUT 600)
+
+  # Entry-extractor suite: assembles its own IR fixtures and compiles the
+  # runtime-registration C++ fixture, so ctest needs no extra setup.
+  add_test(NAME entry_extractor_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/entry_extractor_test.py"
+              --extractor "$<TARGET_FILE:entry_extractor>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+              --clangxx "${LLVM_PREFIX}/bin/clang++"
+              --llvm-as "${LLVM_PREFIX}/bin/llvm-as"
+              --llvm-link "${LLVM_PREFIX}/bin/llvm-link")
+  set_tests_properties(entry_extractor_regression PROPERTIES TIMEOUT 600)
 endif()

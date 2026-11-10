@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     int bcIdx;
     AnalysisConfig config = parseFlags(argc, argv, bcIdx);
 
-    std::string bcFile = (bcIdx > 0) ? argv[bcIdx] : "test_prog.bc";
+    std::string bcFile = (bcIdx > 0) ? argv[bcIdx] : "/home/test/llvm-parser/svf-api-demo/build/tests/test_complex.bc";
 
     return analyzeCallGraph(bcFile, config);
 }
