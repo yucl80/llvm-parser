@@ -178,7 +178,10 @@ int main(int argc, char** argv) {
     int bcIdx;
     AnalysisConfig config = parseFlags(argc, argv, bcIdx);
 
-    std::string bcFile = (bcIdx > 0) ? argv[bcIdx] : "/home/test/llvm-parser/svf-api-demo/build/tests/test_complex.bc";
+    if (bcIdx == -1) {
+        llvm::errs() << "[ERROR] bitcode file path is required\n";
+        exit(1);
+    }    
 
-    return analyzeCallGraph(bcFile, config);
+    return analyzeCallGraph(argv[bcIdx] , config);
 }
