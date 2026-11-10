@@ -3,7 +3,7 @@
         {
             "label": "CMake: build clang_analyzer",
             "type": "shell",
-            "command": "cmake -S ${workspaceFolder}/svf-api-demo -B ${workspaceFolder}/svf-api-demo/build -DCMAKE_BUILD_TYPE=Debug && cmake --build ${workspaceFolder}/svf-api-demo/build --parallel",
+            "command": "cmake -S ${workspaceFolder}/svf-api-demo -B ${workspaceFolder}/svf-api-demo/build -DCMAKE_BUILD_TYPE=Debug \"-DCMAKE_CXX_FLAGS_DEBUG=-g -O0 -fno-omit-frame-pointer\" \"-DCMAKE_C_FLAGS_DEBUG=-g -O0 -fno-omit-frame-pointer\" && cmake --build ${workspaceFolder}/svf-api-demo/build --parallel",
             "options": {
                 "cwd": "${workspaceFolder}"
             },
@@ -23,6 +23,8 @@
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",
+                "-O0",
+                "-fno-omit-frame-pointer",
                 "-std=c++17",
                 "-I${workspaceFolder}/svf-api-demo/include",
                 "-isystem", "${workspaceFolder}/SVF/svf/include",
