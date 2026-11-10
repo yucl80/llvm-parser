@@ -1,0 +1,60 @@
+{
+    "tasks": [
+        {
+            "label": "CMake: build clang_analyzer",
+            "type": "shell",
+            "command": "cmake -S ${workspaceFolder}/svf-api-demo -B ${workspaceFolder}/svf-api-demo/build -DCMAKE_BUILD_TYPE=Debug && cmake --build ${workspaceFolder}/svf-api-demo/build --parallel",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "detail": "使用项目 CMakeLists.txt 构建（带 -g），头文件与链接库路径由 CMake 提供"
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++ build active file",
+            "command": "/usr/bin/g++",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "-std=c++17",
+                "-I${workspaceFolder}/svf-api-demo/include",
+                "-isystem", "${workspaceFolder}/SVF/svf/include",
+                "-isystem", "${workspaceFolder}/SVF/svf-llvm/include",
+                "-isystem", "${workspaceFolder}/SVF/Release-build/include",
+                "-isystem", "/usr/lib/llvm-21/include",
+                "${file}",
+                "${workspaceFolder}/svf-api-demo/build/libsvfanalyzer.a",
+                "-L${workspaceFolder}/SVF/Release-build/lib",
+                "-L/usr/lib/llvm-21/lib",
+                "-Wl,-rpath,${workspaceFolder}/SVF/Release-build/lib:/usr/lib/llvm-21/lib",
+                "-lSvfLLVM",
+                "-lSvfCore",
+                "-lLLVM-21",
+                "-lz3",
+                "-lpthread",
+                "-ldl",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "编译当前文件，包含 SVF / LLVM / 项目头文件路径与链接库"
+        }
+    ],
+    "version": "2.0.0"
+}
