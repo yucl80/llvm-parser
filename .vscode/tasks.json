@@ -41,7 +41,7 @@
                 "-lpthread",
                 "-ldl",
                 "-o",
-                "${fileDirname}/${fileBasenameNoExtension}"
+                "${workspaceFolder}/svf-api-demo/build/${fileBasenameNoExtension}"
             ],
             "options": {
                 "cwd": "${fileDirname}"
