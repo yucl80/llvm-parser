@@ -88,12 +88,13 @@ set_target_properties(entry_extractor PROPERTIES
 # ---------------------------------------------------------------------------
 # Class information tool: ./class_extractor [options] <input> [...]
 #
-# A single CLI entry point (class_cli.cpp) dispatches on the input file type:
-#   .bc / .ll         -> class_bitcode_extractor.cpp (LLVM IR DWARF debug info)
-#   C/C++ source      -> class_source_extractor.cpp  (libclang C API)
-# Both backends fill the same classinfo::ClassReport; class_report.cpp renders
-# it as JSON or text. The bitcode backend needs libLLVM, the source backend
-# needs libclang (neither needs SVF).
+# A single CLI entry point (class_extractor_cli.cpp) dispatches on the input
+# file type:
+#   .bc / .ll         -> class_extractor_bit_code.cpp (LLVM IR DWARF debug info)
+#   C/C++ source      -> class_extractor_source.cpp   (libclang C API)
+# Both backends fill the same classinfo::ClassReport;
+# class_extractor_report.cpp renders it as JSON or text. The bitcode backend
+# needs libLLVM, the source backend needs libclang (neither needs SVF).
 # ---------------------------------------------------------------------------
 # Use the libclang from LLVM_PREFIX (not a cached find_library result, which
 # would go stale when LLVM_PREFIX changes); dev symlink first, soname second.
@@ -115,10 +116,10 @@ if(NOT CLANG_LIB)
 endif()
 
 add_executable(class_extractor
-    src/class_cli.cpp
-    src/class_report.cpp
-    src/class_bitcode_extractor.cpp
-    src/class_source_extractor.cpp)
+    src/class_extractor_cli.cpp
+    src/class_extractor_report.cpp
+    src/class_extractor_bit_code.cpp
+    src/class_extractor_source.cpp)
 target_compile_options(class_extractor PRIVATE -Wall -Wextra)
 target_include_directories(class_extractor PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -129,6 +130,50 @@ target_link_libraries(class_extractor PRIVATE
 # from the LLVM toolchain's lib directory.
 set_target_properties(class_extractor PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
+# SQLite SQL-script extractor: ./sql_extractor [options] <source> [...]
+#
+# Walks C/C++ ASTs with the libclang C API to recover static SQL passed to
+# sqlite3_exec / sqlite3_prepare_* (and any --api the user declares). Only
+# libclang is needed: no SVF, no LLVM IR, no bitcode.
+# ---------------------------------------------------------------------------
+add_executable(sql_extractor
+    src/sql_extractor_cli.cpp
+    src/sql_extractor_source.cpp
+    src/sql_extractor_report.cpp)
+target_compile_options(sql_extractor PRIVATE -Wall -Wextra)
+target_include_directories(sql_extractor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(sql_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+target_link_libraries(sql_extractor PRIVATE "${CLANG_LIB}" ${CMAKE_DL_LIBS})
+set_target_properties(sql_extractor PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
+# Bitcode SQLite SQL-script extractor: ./sql_bitcode_extractor [options] <module>
+#
+# Parses LLVM bitcode/IR with the IR reader and recovers the SQL argument of
+# sqlite3_* calls: literals, global constants, functions returning a constant
+# (interprocedurally) and branch fragments. A SVF/Andersen pointer-analysis
+# layer resolves indirect-call targets (virtual dispatch, function pointers,
+# dispatch tables, std::function/lambdas) into SQL candidates. Shared report
+# output and CLI parsing live in sql_extractor_report.cpp.
+# ---------------------------------------------------------------------------
+add_executable(sql_bitcode_extractor
+    src/sql_extractor_bit_code.cpp
+    src/sql_extractor_report.cpp)
+target_compile_options(sql_bitcode_extractor PRIVATE -Wall -Wextra)
+target_include_directories(sql_bitcode_extractor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(sql_bitcode_extractor SYSTEM PRIVATE
+    "${LLVM_INCLUDE_DIR}" ${SVF_INCLUDE_DIRS})
+# Pull in SVF (headers + libraries: SvfCore/SvfLLVM, LLVM, z3) via the
+# svfanalyzer library, which already configures them as PUBLIC.
+target_link_libraries(sql_bitcode_extractor PRIVATE svfanalyzer
+    "${LLVM_LIB}" ${CMAKE_DL_LIBS})
+set_target_properties(sql_bitcode_extractor PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib;${SVF_BUILD_DIR}/lib")
 
 # ---------------------------------------------------------------------------
 # Native test program (builds with the default host compiler; no SVF).
@@ -169,10 +214,20 @@ add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_web_service.bc"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_service.cpp"
     COMMENT "Compiling tests/test_web_service.cpp to LLVM bitcode")
 
+# SQLite fixture: source extraction and bitcode extraction share this file.
+add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_sqlite_source.bc"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${TEST_BITCODE_DIR}"
+    COMMAND "${LLVM_PREFIX}/bin/clang++" -std=c++17 -O0 -g -emit-llvm -c
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sqlite_source.cpp"
+            -o "${TEST_BITCODE_DIR}/test_sqlite_source.bc"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sqlite_source.cpp"
+    COMMENT "Compiling tests/test_sqlite_source.cpp to LLVM bitcode")
+
 add_custom_target(bitcode ALL DEPENDS
     "${TEST_BITCODE_DIR}/test_complex.bc"
     "${TEST_BITCODE_DIR}/test_prog.bc"
-    "${TEST_BITCODE_DIR}/test_web_service.bc")
+    "${TEST_BITCODE_DIR}/test_web_service.bc"
+    "${TEST_BITCODE_DIR}/test_sqlite_source.bc")
 
 # ---------------------------------------------------------------------------
 # Deployable runtime (self-contained; no LD_LIBRARY_PATH needed on the target)
@@ -272,4 +327,23 @@ if(Python3_Interpreter_FOUND)
               --llvm-as "${LLVM_PREFIX}/bin/llvm-as"
               --llvm-link "${LLVM_PREFIX}/bin/llvm-link")
   set_tests_properties(entry_extractor_regression PROPERTIES TIMEOUT 600)
+
+  # SQL extractor suite: parses the C++ fixture with libclang and asserts
+  # the JSON/text/SQL reports, API configuration and CLI error paths.
+  add_test(NAME sql_extractor_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/sql_extractor_test.py"
+              --extractor "$<TARGET_FILE:sql_extractor>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  set_tests_properties(sql_extractor_regression PROPERTIES TIMEOUT 300)
+
+  # Bitcode SQL extractor suite: parses the shared SQLite fixture and asserts
+  # static SQL, function/indirect-call candidates and dynamic values.
+  add_test(NAME sql_bitcode_extractor_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/sql_bitcode_extractor_test.py"
+              --extractor "$<TARGET_FILE:sql_bitcode_extractor>"
+              --source-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+              --bitcode "${TEST_BITCODE_DIR}/test_sqlite_source.bc")
+  set_tests_properties(sql_bitcode_extractor_regression PROPERTIES TIMEOUT 300)
 endif()

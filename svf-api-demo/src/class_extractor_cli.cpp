@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// class_cli.cpp — single entry point of the class-information tool.
+// class_extractor_cli.cpp — single entry point of the class-information tool.
 //
 //   ./class_extractor [options] <input> [more inputs ...] [-- <clang args>]
 //

@@ -23,11 +23,11 @@ bases and inheritance. Its input file type selects the backend:
 
 | Input | Backend |
 |-------|---------|
-| `.bc`, `.ll` (LLVM bitcode / textual IR, compiled with `-g`) | `src/class_bitcode_extractor.cpp` — DWARF debug info via the LLVM API |
-| `.c`, `.cpp`, `.h`, ... (C/C++ sources) | `src/class_source_extractor.cpp` — libclang C API |
+| `.bc`, `.ll` (LLVM bitcode / textual IR, compiled with `-g`) | `src/class_extractor_bit_code.cpp` — DWARF debug info via the LLVM API |
+| `.c`, `.cpp`, `.h`, ... (C/C++ sources) | `src/class_extractor_source.cpp` — libclang C API |
 
-`src/class_cli.cpp` is the single entry point (type detection + dispatch),
-`include/class_report.h` / `src/class_report.cpp` hold the shared report model
+`src/class_extractor_cli.cpp` is the single entry point (type detection + dispatch),
+`include/class_report.h` / `src/class_extractor_report.cpp` hold the shared report model
 and the JSON/text writers. Extension-less inputs are classified by content;
 `--input-type bitcode|source` forces a backend.
 
@@ -39,6 +39,94 @@ and the JSON/text writers. Extension-less inputs are classified by content;
 
 `--include-library` keeps non-application classes in bitcode reports;
 `--all` includes classes from (non-system) headers in source reports.
+
+### SQLite SQL Scripts
+
+`svf-api-demo/build/sql_extractor` uses libclang to recover SQLite SQL
+statements from C/C++ sources. It matches `sqlite3_exec`, `sqlite3_prepare*`,
+`sqlite3_get_table` and `sqlite3_declare_vtab` calls and statically evaluates
+the SQL argument: escaped/raw/adjacent literals, macro expansions, `const
+char*` / `std::string` constants (`sql.c_str()`), parentheses, casts and
+concatenations.
+
+Polymorphic SQL builders are resolved as well: functions returning a constant,
+virtual dispatch (one report per override, including chained overrides),
+function pointers and dispatch tables, lambdas / `std::function` callables,
+format templates (`%d` / `{}` placeholders) and static fragments of
+conditional or concatenated expressions. Each statement carries an `origin`
+(`call`, `function`, `virtual`, `callable`, `format`, `fragment`, `literal`)
+and a `symbol` naming the producer; alternative variants and fragments are
+marked incomplete. `--no-dispatch` switches back to strict extraction, where
+anything not statically resolvable is reported as `dynamic` instead of being
+guessed.
+
+| Flag | Description |
+|------|-------------|
+| `--format <json\|text\|sql>` | Structured report (default), one line per statement, or a runnable `.sql` script |
+| `--output <file>` | Write to a file instead of stdout |
+| `--api <name[:argno]>` | Extra SQL-carrying callee with a 0-based argument index, e.g. `--api QSqlQuery::prepare:0` (repeatable) |
+| `--no-builtin` | Disable the built-in `sqlite3_*` list |
+| `--scan-literals` | Also collect SQL-looking literals not consumed by a resolved call |
+| `--include-headers` | Scan non-system headers too |
+| `--unique` | Drop statements with duplicate SQL text |
+| `--no-dispatch` | Disable producer/fragment inference (strict static mode) |
+| `-- <clang args>` | Pass `-I`, `-D`, `-std=c++20`, ... to clang |
+
+```bash
+./svf-api-demo/build/sql_extractor --format sql --output schema.sql \
+    svf-api-demo/tests/test_sqlite_source.cpp
+./svf-api-demo/build/sql_extractor --scan-literals --format json \
+    src/db.cpp src/schema.cpp -- -Iinclude -DUSE_SQLITE
+```
+
+`svf-api-demo/tests/test_sqlite_source.cpp` is the fixture covering literals,
+macros, constants, `std::string` wrappers, raw strings, concatenation, virtual
+overrides, function-pointer tables, lambdas / `std::function`, format templates,
+custom APIs and dynamic SQL. Its `runDynamicSql()` function adds six run-time
+SQL-assembly shapes — `operator+` with a parameter, `+=` with `std::to_string`,
+an `append()` chain, `std::ostringstream`, `snprintf` into a stack buffer and a
+loop-accumulated predicate. Both back ends must report these as `dynamic` with
+no fabricated SQL, as they are the classic SQL-injection patterns.
+`svf-api-demo/tests/sql_extractor_test.py` is its CTest regression suite
+(`sql_extractor_regression`).
+
+### SQLite SQL Scripts from Bitcode
+
+`svf-api-demo/build/sql_bitcode_extractor` extracts the same SQLite SQL reports
+directly from LLVM bitcode / IR (`.bc` / `.ll`) with the LLVM IR reader. It
+follows the SQL argument of `sqlite3_*` calls through:
+
+* string literals and global constants (including GEPs into merged string
+  pools / string tables);
+* functions returning a constant — their `return` statements are traced
+  interprocedurally and recorded as `symbol`;
+* branch fragments — a `select` / `phi` over constant SQL is reported as
+  alternatives rather than one fabricated statement;
+* indirect calls — a SVF/Andersen pointer-analysis layer resolves virtual
+  dispatch, function pointers, global function-pointer tables and
+  `std::function` / lambda targets to concrete callees; each callee's returned
+  SQL becomes a candidate (several targets are reported as alternatives, not
+  guessed). The call graph (`getIndCallMap`, paired to LLVM calls via
+  `getCallICFGNode`), the raw PAG points-to set of the call's function pointer,
+  and — for `-O0` array loads — the field-object points-to sets that hold a
+  dispatch table's initializer are combined;
+* genuinely runtime values (a local load, a `std::string` conversion, a format
+  template, a runtime parameter and SQL assembled at run time via `operator+`,
+  `+=`, `append()`, streams, `snprintf` or loops) are reported as `dynamic`
+  instead of guessed.
+
+The flags, `origin` / `symbol` fields and JSON / text / SQL layouts are identical
+to the source extractor, so both back ends feed the same report consumers.
+
+```bash
+./svf-api-demo/build/sql_bitcode_extractor --format sql --output schema.sql \
+    build/tests/test_sqlite_source.bc
+```
+
+The `svf-api-demo/tests/test_sqlite_source.cpp` fixture above is compiled to
+`test_sqlite_source.bc` with `-g` and shared by the source and bitcode
+extractors. `svf-api-demo/tests/sql_bitcode_extractor_test.py` is the CTest
+regression suite (`sql_bitcode_extractor_regression`).
 
 ### Test Programs
 

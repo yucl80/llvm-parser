@@ -1,5 +1,6 @@
 //===----------------------------------------------------------------------===//
-// class_report.cpp — input type detection and the shared report writers.
+// class_extractor_report.cpp — input type detection and the shared report
+// writers.
 //
 // Both extraction backends produce a classinfo::ClassReport; the CLI renders
 // it here as either JSON or text, so the output layout no longer depends on

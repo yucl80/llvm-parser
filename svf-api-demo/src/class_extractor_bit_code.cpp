@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// class_bitcode_extractor.cpp — bitcode backend of the class-information tool.
+// class_extractor_bit_code.cpp — bitcode backend of the class-information tool.
 //
 // Extracts every class, its member functions, fields and inheritance
 // relationships from a C/C++ LLVM bitcode module's DWARF debug info (compile
@@ -16,7 +16,7 @@
 // libstdc++/glibc headers, other library code linked into the module) are
 // hidden by default; --include-library keeps them.
 //
-// The CLI (class_cli.cpp) dispatches .bc/.ll inputs here and writes the
+// The CLI (class_extractor_cli.cpp) dispatches .bc/.ll inputs here and writes the
 // resulting classinfo::ClassReport itself.
 //===----------------------------------------------------------------------===//
 

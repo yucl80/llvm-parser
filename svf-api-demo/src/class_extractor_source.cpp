@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// class_source_extractor.cpp — source backend of the class-information tool.
+// class_extractor_source.cpp — source backend of the class-information tool.
 //
 // Uses libclang's C API to report, for every class/struct/union defined in the
 // given source files:
@@ -9,7 +9,7 @@
 //     virtual/deleted/defaulted/template)
 //   - for each member function, the base-class functions it overrides
 //
-// The CLI (class_cli.cpp) dispatches C/C++ source inputs here and writes the
+// The CLI (class_extractor_cli.cpp) dispatches C/C++ source inputs here and writes the
 // resulting classinfo::ClassReport itself.
 //===----------------------------------------------------------------------===//
 

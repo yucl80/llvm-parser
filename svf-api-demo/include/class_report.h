@@ -2,11 +2,11 @@
 // class_report.h — shared data model for class-information extraction.
 //
 // Two backends fill the very same report:
-//   * class_bitcode_extractor.cpp : LLVM bitcode / IR (DWARF debug info)
-//   * class_source_extractor.cpp  : C/C++ source files (libclang C API)
+//   * class_extractor_bit_code.cpp : LLVM bitcode / IR (DWARF debug info)
+//   * class_extractor_source.cpp   : C/C++ source files (libclang C API)
 //
-// class_cli.cpp is the single entry point: it detects the input file type,
-// dispatches to the matching backend and renders the result with
+// class_extractor_cli.cpp is the single entry point: it detects the input
+// file type, dispatches to the matching backend and renders the result with
 // writeClassReport(). Backends never parse CLI arguments or write reports.
 //===----------------------------------------------------------------------===//
 
