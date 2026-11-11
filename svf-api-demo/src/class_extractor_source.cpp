@@ -101,6 +101,13 @@ std::string locationStr(CXCursor C) {
   return Name + ":" + std::to_string(Line);
 }
 
+unsigned sourceLine(CXSourceLocation Loc) {
+  CXFile File = nullptr;
+  unsigned Line = 0, Column = 0, Offset = 0;
+  clang_getExpansionLocation(Loc, &File, &Line, &Column, &Offset);
+  return Line;
+}
+
 /// Split libclang's "file:line" location into the shared report's fields.
 void splitLocation(const std::string &Loc, std::string &File, unsigned &Line) {
   const size_t Colon = Loc.rfind(':');
@@ -343,6 +350,11 @@ private:
     MI.name = toStd(clang_getCursorSpelling(M));
     MI.access = accessStr(clang_getCXXAccessSpecifier(M));
     splitLocation(locationStr(M), MI.file, MI.line);
+    CXSourceRange Extent = clang_getCursorExtent(M);
+    MI.startLine = sourceLine(clang_getRangeStart(Extent));
+    MI.endLine = sourceLine(clang_getRangeEnd(Extent));
+    if (!MI.startLine) MI.startLine = MI.line;
+    if (!MI.endLine) MI.endLine = MI.startLine;
     MI.signature = stripDecorators(IsTemplate
                                        ? templateMethodSignature(M)
                                        : methodSignature(M, MethodKind));

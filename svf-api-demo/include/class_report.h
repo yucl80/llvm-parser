@@ -45,7 +45,11 @@ struct MethodInfo {
     std::string linkageName; ///< mangled symbol, bitcode backend only
     std::string access;
     std::string file;
+    /// Legacy source location line retained in the JSON report.
     unsigned line = 0;
+    /// Inclusive source range; bitcode end lines are inferred from debug locations.
+    unsigned startLine = 0;
+    unsigned endLine = 0;
     /// source backend: ctor, dtor, template, conversion, defaulted, ...
     std::vector<std::string> flags;
     /// source backend: base-class functions this method overrides

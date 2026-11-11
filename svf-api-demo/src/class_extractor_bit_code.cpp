@@ -313,6 +313,25 @@ public:
         llvm::DebugInfoFinder finder;
         finder.processModule(M_);
 
+        std::unordered_map<const llvm::DISubprogram*, unsigned> endLines;
+        for (const llvm::Function& function : M_) {
+            const llvm::DISubprogram* subprogram = function.getSubprogram();
+            if (!subprogram) continue;
+            for (const llvm::BasicBlock& block : function) {
+                for (const llvm::Instruction& instruction : block) {
+                    const llvm::DebugLoc location = instruction.getDebugLoc();
+                    if (!location ||
+                        !location->getScope() ||
+                        location->getScope()->getSubprogram() != subprogram)
+                        continue;
+                    const unsigned line = location.getLine();
+                    if (line)
+                        endLines[subprogram] =
+                            std::max(endLines[subprogram], line);
+                }
+            }
+        }
+
         std::vector<llvm::DIType*> work;
         const auto push = [&work](llvm::DIType* type) {
             if (type) work.push_back(type);
@@ -349,7 +368,7 @@ public:
             }
         }
 
-        collectClasses(work);
+        collectClasses(work, endLines);
 
         // Attach out-of-line definitions: a DISubprogram whose containing type
         // is a class is a member function of that class.
@@ -365,7 +384,8 @@ public:
             if (index == kNoIndex) continue;
             addMethod(classes_[index], sp,
                       owner->getName().empty() ||
-                          owner->getTag() != llvm::dwarf::DW_TAG_class_type);
+                          owner->getTag() != llvm::dwarf::DW_TAG_class_type,
+                      endLines);
         }
 
         std::sort(classes_.begin(), classes_.end(),
@@ -390,7 +410,10 @@ public:
 private:
     static constexpr size_t kNoIndex = static_cast<size_t>(-1);
 
-    void collectClasses(std::vector<llvm::DIType*>& work) {
+    void collectClasses(
+        std::vector<llvm::DIType*>& work,
+        const std::unordered_map<const llvm::DISubprogram*, unsigned>&
+            endLines) {
         std::unordered_set<const llvm::DIType*> seen;
         while (!work.empty()) {
             llvm::DIType* type = work.back();
@@ -403,7 +426,7 @@ private:
                     !composite->isForwardDecl()) {
                     const size_t index = classIndex(composite);
                     if (index != kNoIndex)
-                        fillClass(classes_[index], composite);
+                        fillClass(classes_[index], composite, endLines);
                 }
                 if (composite->getBaseType())
                     work.push_back(composite->getBaseType());
@@ -466,7 +489,10 @@ private:
         return index;
     }
 
-    void fillClass(ClassInfo& cls, llvm::DICompositeType* type) {
+    void fillClass(
+        ClassInfo& cls, llvm::DICompositeType* type,
+        const std::unordered_map<const llvm::DISubprogram*, unsigned>&
+            endLines) {
         // Lambdas / anonymous types have no name and their synthesized members
         // are public; for named types the class default is private.
         const bool defaultPublic =
@@ -495,7 +521,7 @@ private:
                     cls.fields.push_back(std::move(field));
                 }
             } else if (auto* sp = llvm::dyn_cast<llvm::DISubprogram>(element)) {
-                addMethod(cls, sp, defaultPublic);
+                addMethod(cls, sp, defaultPublic, endLines);
             }
         }
     }
@@ -516,6 +542,8 @@ private:
             dst.isDefinition = true;
             dst.file = src.file;
             dst.line = src.line;
+            dst.startLine = src.startLine;
+            dst.endLine = src.endLine;
             dst.signature = src.signature;
         }
         if (src.isVirtual) dst.isVirtual = true;
@@ -525,7 +553,9 @@ private:
     }
 
     static void addMethod(ClassInfo& cls, llvm::DISubprogram* sp,
-                          bool defaultPublic) {
+                          bool defaultPublic,
+                          const std::unordered_map<const llvm::DISubprogram*,
+                                                   unsigned>& endLines) {
         if (!sp || sp->getName().empty()) return;
 
         MethodInfo method;
@@ -539,6 +569,10 @@ private:
         method.access = accessString(sp, defaultPublic);
         method.file = sp->getFilename().str();
         method.line = sp->getLine();
+        method.startLine = sp->getLine();
+        const auto endLine = endLines.find(sp);
+        method.endLine = endLine == endLines.end() ? method.startLine
+                                                   : endLine->second;
         method.isDefinition = sp->isDefinition();
         method.isStatic =
             (sp->getFlags() & llvm::DINode::FlagStaticMember) != 0;

@@ -160,7 +160,8 @@ void writeTextReport(std::string& out, const ClassReport& report) {
             out += "]";
             if (!method.file.empty())
                 out += "  " + method.file + ":" +
-                       std::to_string(method.line);
+                       std::to_string(method.startLine) + "-" +
+                       std::to_string(method.endLine);
             out += "\n";
             for (const std::string& overridden : method.overridden)
                 out += "      overrides " + overridden + "\n";
@@ -271,6 +272,8 @@ void writeJsonReport(std::string& out, const ClassReport& report) {
             out += boolText(method.isDefinition);
             out += ", \"file\": \"" + jsonEscape(method.file) +
                    "\", \"line\": " + std::to_string(method.line) +
+                   ", \"start_line\": " + std::to_string(method.startLine) +
+                   ", \"end_line\": " + std::to_string(method.endLine) +
                    ", \"flags\": ";
             appendStringArray(out, method.flags);
             out += ", \"overridden\": ";
