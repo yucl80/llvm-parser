@@ -63,9 +63,16 @@ public:
     /// Classify the module's functions from their definition sites. Must run
     /// before SVF builds its model (see the class comment). \p namePatterns is
     /// the user's filter file content; an invalid expression is reported and
-    /// skipped.
+    /// skipped. When \p appSourceRoots is non-empty, only files below those
+    /// directories are considered application code. Otherwise the compile
+    /// unit directories are used as a best-effort fallback.
     static FunctionFilter build(const llvm::Module& M,
-                                const std::vector<std::string>& namePatterns = {});
+                                const std::vector<std::string>& namePatterns = {},
+                                const std::vector<std::string>& appSourceRoots = {});
+    static FunctionFilter build(
+        const std::vector<const llvm::Module*>& modules,
+        const std::vector<std::string>& namePatterns = {},
+        const std::vector<std::string>& appSourceRoots = {});
 
     /// True when \p mangled / \p demangled names library code.
     bool isExcluded(const std::string& mangled,
@@ -97,8 +104,7 @@ private:
     /// Compiled user name patterns (filter file), empty when no filter file was
     /// given.
     std::vector<std::regex> namePatterns_;
-    /// The analyzed application's own source tree, derived from the module's
-    /// compile units: normalized, sorted, no trailing '/'.
+    /// The application's source roots: normalized, sorted, no trailing '/'.
     std::vector<std::string> appDirs_;
 };
 

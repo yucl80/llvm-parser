@@ -48,7 +48,7 @@ static const std::string& demangleFuncName(const std::string& mangled) {
 /// Only the minimum line is needed (the caller uses front() of the previously
 /// sorted set), and an edge is re-traversed for every path that reaches it, so
 /// the result is computed once per unique edge and memoized.
-static std::optional<CallSiteLoc> getMinCallSiteLoc(
+static const std::optional<CallSiteLoc>& getMinCallSiteLoc(
     const CallGraphEdge* edge,
     LLVMModuleSet* modSet,
     std::unordered_map<const CallGraphEdge*, std::optional<CallSiteLoc>>& cache) {
@@ -71,8 +71,7 @@ static std::optional<CallSiteLoc> getMinCallSiteLoc(
     };
     collect(edge->directCallsBegin(), edge->directCallsEnd());
     collect(edge->indirectCallsBegin(), edge->indirectCallsEnd());
-    cache.emplace(edge, minLoc);
-    return minLoc;
+    return cache.emplace(edge, std::move(minLoc)).first->second;
 }
 
 /// Lazy per-function descriptor cache, keyed by the function's FunObjVar
@@ -180,7 +179,8 @@ static void emitSpans(CallGraphNode* node,
         if (!callee->getFunction()) continue;
 
         const bool childIndirect = edge->isIndirectCallEdge();
-        std::optional<CallSiteLoc> cl = getMinCallSiteLoc(edge, modSet, callSiteLocCache);
+        const std::optional<CallSiteLoc>& cl =
+            getMinCallSiteLoc(edge, modSet, callSiteLocCache);
 
         const FuncInfo& ci = getFuncInfo(callee->getFunction(), excludeStd,
                                          filter, infoCache);

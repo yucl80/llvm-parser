@@ -5,6 +5,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <utility>
 
 /// Strip the outermost parameter list of a demangled name:
@@ -106,16 +107,6 @@ static std::string joinPath(const std::string& dir, const std::string& name) {
     return dir.back() == '/' ? dir + name : dir + "/" + name;
 }
 
-/// Parent directory of a path; empty for "/" and for a bare file name. Works
-/// for relative paths too, so a compile unit without an absolute directory
-/// still contributes its tree.
-static std::string parentDir(const std::string& path) {
-    size_t slash = path.rfind('/');
-    if (slash == std::string::npos || slash == 0)
-        return {};
-    return path.substr(0, slash);
-}
-
 /// Full, normalized path of a DIFile (definition site or call site).
 static std::string filePath(const llvm::DIFile* file) {
     if (!file) return {};
@@ -123,25 +114,41 @@ static std::string filePath(const llvm::DIFile* file) {
                                   file->getFilename().str()));
 }
 
-/// The application's source tree, derived from the module's compile units: a
-/// function is application code when the file it is *defined* in lives under
-/// one of these directories; headers and C/C++ library sources linked into the
-/// module are library code. This decides membership by origin, not by name.
-/// Each compile unit contributes its own directory and its parent, so headers
-/// kept beside the sources (include/, ../include) stay application code.
-/// Without debug info there are no compile units: the tree is empty and the
-/// classifier falls back to system-header detection.
+/// Best-effort application directories when the caller supplied no explicit
+/// roots. Do not add parent directories: a parent may contain unrelated
+/// third-party or generated code. Projects with separate source/header trees
+/// should pass those roots explicitly.
 static std::vector<std::string> buildAppSourceDirs(const llvm::Module& M) {
     std::vector<std::string> dirs;
     for (const llvm::DICompileUnit* cu : M.debug_compile_units()) {
         const llvm::DIFile* file = cu ? cu->getFile() : nullptr;
         if (!file) continue;
-        // The compile unit's directory and its parent.
-        std::string dir = parentDir(filePath(file));
-        for (int level = 0; level < 2 && !dir.empty() && dir != "/"; ++level) {
-            dirs.push_back(dir);
-            dir = parentDir(dir);
+        std::string source = filePath(file);
+        if (source.empty()) continue;
+        size_t slash = source.rfind('/');
+        if (slash != std::string::npos && slash > 0)
+            dirs.push_back(source.substr(0, slash));
+    }
+    std::sort(dirs.begin(), dirs.end());
+    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+    return dirs;
+}
+
+static std::vector<std::string> normalizeAppSourceRoots(
+    const std::vector<std::string>& roots) {
+    std::vector<std::string> dirs;
+    dirs.reserve(roots.size());
+    for (const std::string& root : roots) {
+        std::error_code ec;
+        std::filesystem::path path(root);
+        if (path.is_relative())
+            path = std::filesystem::absolute(path, ec);
+        if (ec) {
+            llvm::errs() << "[ERROR] cannot resolve application source root \""
+                         << root << "\": " << ec.message() << "\n";
+            continue;
         }
+        dirs.push_back(normalizePath(path.lexically_normal().string()));
     }
     std::sort(dirs.begin(), dirs.end());
     dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
@@ -207,17 +214,48 @@ static FuncLineRange getFuncLineRange(const llvm::Function& F) {
 }
 
 FunctionFilter FunctionFilter::build(
-    const llvm::Module& M, const std::vector<std::string>& namePatterns) {
+    const llvm::Module& M, const std::vector<std::string>& namePatterns,
+    const std::vector<std::string>& appSourceRoots) {
+    return build(std::vector<const llvm::Module*>{&M}, namePatterns,
+                 appSourceRoots);
+}
+
+FunctionFilter FunctionFilter::build(
+    const std::vector<const llvm::Module*>& modules,
+    const std::vector<std::string>& namePatterns,
+    const std::vector<std::string>& appSourceRoots) {
     FunctionFilter filter;
-    for (const llvm::Function& F : M) {
-        const std::string name = F.getName().str();
-        FuncLineRange range = getFuncLineRange(F);
-        if (range.hasInfo)
-            filter.lineRanges_[name] = std::move(range);
-        if (F.isDeclaration())
-            filter.externalDecls_.insert(name);
+    std::unordered_set<std::string> definedFunctions;
+    for (const llvm::Module* module : modules) {
+        if (!module) continue;
+        for (const llvm::Function& F : *module) {
+            const std::string name = F.getName().str();
+            if (F.isDeclaration()) {
+                filter.externalDecls_.insert(name);
+                continue;
+            }
+            definedFunctions.insert(name);
+            FuncLineRange range = getFuncLineRange(F);
+            if (range.hasInfo)
+                filter.lineRanges_[name] = std::move(range);
+        }
     }
-    filter.appDirs_ = buildAppSourceDirs(M);
+    for (const std::string& name : definedFunctions)
+        filter.externalDecls_.erase(name);
+    if (!appSourceRoots.empty()) {
+        filter.appDirs_ = normalizeAppSourceRoots(appSourceRoots);
+    } else {
+        for (const llvm::Module* module : modules) {
+            if (!module) continue;
+            std::vector<std::string> dirs = buildAppSourceDirs(*module);
+            filter.appDirs_.insert(filter.appDirs_.end(), dirs.begin(),
+                                   dirs.end());
+        }
+    }
+    std::sort(filter.appDirs_.begin(), filter.appDirs_.end());
+    filter.appDirs_.erase(
+        std::unique(filter.appDirs_.begin(), filter.appDirs_.end()),
+        filter.appDirs_.end());
 
     // One ECMAScript regex per line; a malformed expression is a configuration
     // error, not a reason to abort the analysis, so report and skip it.

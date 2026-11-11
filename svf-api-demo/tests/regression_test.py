@@ -11,6 +11,7 @@ scenarios those inputs cannot verify on their own:
   * filter files: demangled / parameter-stripped / mangled matches, invalid
     and missing patterns, hidden-node callback grafting;
   * multiple, mangled, missing and filtered entries, --entry-file;
+  * same-named internal functions across modules and explicit app roots;
   * TSV escaping, both report layouts, indirect/cycle markers;
   * newly added operator-overload and functor call scenarios;
   * anonymous-namespace function names in the report;
@@ -67,6 +68,64 @@ class Suite:
             subprocess.run(cmd, check=True, capture_output=True, text=True,
                            timeout=180)
             self.bc[key] = str(out)
+        cross_main = work / "cross_module_main.c"
+        cross_target = work / "cross_module_target.c"
+        cross_main.write_text(
+            "extern int target(void);\n"
+            "int main(void) { int (*callback)(void) = target; return callback(); }\n",
+            encoding="utf-8")
+        cross_target.write_text("int target(void) { return 7; }\n",
+                                encoding="utf-8")
+        for key, src in (("cross_main", cross_main),
+                         ("cross_target", cross_target)):
+            out = work / (key + ".bc")
+            subprocess.run(
+                [args.clang, "-O0", "-g", "-emit-llvm", "-c",
+                 str(src), "-o", str(out)],
+                check=True, capture_output=True, text=True, timeout=180)
+            self.bc[key] = str(out)
+        same_main = work / "same_name_main.c"
+        same_target = work / "same_name_target.c"
+        same_main.write_text(
+            "static int helper(void) { return 1; }\n"
+            "extern int target(void);\n"
+            "int main(void) { return helper() + target(); }\n",
+            encoding="utf-8")
+        same_target.write_text(
+            "static int helper(void) { return 2; }\n"
+            "int target(void) { return helper(); }\n",
+            encoding="utf-8")
+        for key, src in (("same_name_main", same_main),
+                         ("same_name_target", same_target)):
+            out = work / (key + ".bc")
+            subprocess.run(
+                [args.clang, "-O0", "-g", "-emit-llvm", "-c",
+                 str(src), "-o", str(out)],
+                check=True, capture_output=True, text=True, timeout=180)
+            self.bc[key] = str(out)
+
+        app_dir = work / "source_root_case" / "app"
+        app_dir.mkdir(parents=True)
+        neighbor_dir = work / "source_root_case" / "app_vendor"
+        neighbor_dir.mkdir()
+        app_main = app_dir / "main.c"
+        app_main.write_text(
+            "extern int vendor_function(void);\n"
+            "int main(void) { return vendor_function(); }\n",
+            encoding="utf-8")
+        vendor_source = neighbor_dir / "vendor.c"
+        vendor_source.write_text(
+            "int vendor_function(void) { return 3; }\n",
+            encoding="utf-8")
+        for key, src in (("app_root_main", app_main),
+                         ("app_root_vendor", vendor_source)):
+            out = work / (key + ".bc")
+            subprocess.run(
+                [args.clang, "-O0", "-g", "-emit-llvm", "-c",
+                 str(src), "-o", str(out)],
+                check=True, capture_output=True, text=True, timeout=180)
+            self.bc[key] = str(out)
+        self.app_source_root = str(app_dir)
 
     def expect(self, condition, message):
         if not condition:
@@ -175,6 +234,40 @@ class Suite:
                     "call-site columns missing with -g")
         self.expect(self.span_count(r.text) == 4 and
                     "reachable_funcs=4" in r.text, "wrong #end summary")
+
+    def test_multiple_bitcode_modules(self):
+        for mode in ([], ["--dda"]):
+            r = self.run_analyzer(mode + [
+                self.bc["cross_main"], self.bc["cross_target"]])
+            p = self.parse(r.text)
+            self.expect(r.rc == 0, "multi-module analysis failed: %s" % r.log)
+            self.expect(set(p.functions) == {"main", "target"},
+                        "cross-module function pointer was not resolved: %s\n%s" %
+                        (p.functions, r.log))
+
+    def test_same_named_internal_functions_across_modules(self):
+        r = self.run_analyzer([
+            self.bc["same_name_main"], self.bc["same_name_target"]])
+        p = self.parse(r.text)
+        helpers = [row for row in p.spans
+                   if row[5].startswith("helper")]
+        self.expect(r.rc == 0, "same-name multi-module analysis failed: %s" %
+                    r.log)
+        self.expect(len(helpers) >= 2,
+                    "same-named internal functions were lost: %s" % p.functions)
+        self.expect(all(row[7] and row[8] and row[9] for row in helpers),
+                    "renamed internal functions lost debug locations")
+
+    def test_explicit_app_source_root(self):
+        r = self.run_analyzer([
+            "--app-source-root", self.app_source_root,
+            self.bc["app_root_main"], self.bc["app_root_vendor"]])
+        p = self.parse(r.text)
+        self.expect(r.rc == 0, "explicit app-source-root analysis failed: %s" %
+                    r.log)
+        self.expect("main" in p.functions, "application entry disappeared")
+        self.expect("vendor_function" not in p.functions,
+                    "sibling directory with a common prefix was treated as app")
 
     def test_tree_layout(self):
         r = self.run_analyzer([self.bc["prog"]], fmt="tree")
@@ -388,6 +481,13 @@ class Suite:
         missing = self.raw([self.work / "no_such.bc"])
         self.expect(missing.rc != 0 and "Failed to load bitcode" in missing.log,
                     "missing bitcode must be reported as an error")
+        bad_root = self.raw([
+            "--app-source-root", self.work / "no_such_directory",
+            self.bc["prog"]])
+        self.expect(
+            bad_root.rc == 1 and "application source root is not a directory"
+            in bad_root.log,
+            "invalid application source root must be rejected")
 
     def test_web_service_http_entry_chains(self):
         """Each HTTP entry keeps its own business chain, sharing middleware."""

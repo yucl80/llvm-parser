@@ -3,14 +3,16 @@
 
 #include "callgraph_sink.h"
 
+#include <cstddef>
 #include <iosfwd>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
 
 /// One span produced by the traversal, as stored by the tree renderer.
-/// Strings are not copied: \p info points into the FuncInfoCache, whose
-/// elements are stable for the whole report.
+/// The pointers refer to the FuncInfo and call-site caches, whose elements
+/// remain stable for the whole report.
 struct SpanRecord {
     const FuncInfo* info;
     unsigned parent = 0;
@@ -18,7 +20,7 @@ struct SpanRecord {
     bool indirect = false;
     unsigned depth = 0;
     bool cycle = false;
-    std::optional<CallSiteLoc> callLoc;
+    const CallSiteLoc* callLoc = nullptr;
 };
 
 /// Human-readable layout: each entry's call chain as an indented ASCII tree.
@@ -44,12 +46,16 @@ public:
                   size_t reachable) override;
 
 private:
-    void renderNode(unsigned idx, const std::string& prefix, bool last,
+    static constexpr size_t kNoSpan = std::numeric_limits<size_t>::max();
+
+    void renderNode(size_t idx, const std::string& prefix, bool last,
                     bool hasParent);
 
     std::ostream& os_;
     std::vector<SpanRecord> spans_;
-    std::vector<std::vector<unsigned>> kids_;
+    std::vector<size_t> firstChild_;
+    std::vector<size_t> lastChild_;
+    std::vector<size_t> nextSibling_;
 };
 
 #endif // CALLGRAPH_TREE_SINK_H

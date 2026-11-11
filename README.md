@@ -266,9 +266,15 @@ The output call graph **excludes library code** by default, so only the
 analyzed application's own call chains are reported. The decision is made from
 **where each function is defined**, not from a list of library function names:
 
-- the application's source tree is derived from the module's **compile units**
-  (each unit's directory and its parent, so project headers next to the sources
-  stay application code);
+- by default, the application's source directories are inferred from the
+  module's compile units. This is a best-effort fallback and does not include
+  parent directories, avoiding accidental inclusion of neighboring
+  third-party/generated trees;
+- for reliable classification when third-party bitcode is linked into the
+  program or headers live in separate directories, pass one or more
+  `--app-source-root <dir>` options. Only definitions below these explicit
+  roots are considered application code; relative roots use the current
+  working directory;
 - a function whose definition file lies **outside that tree** is library code —
   this is what filters the C library (`strrchr`, `memcpy`, ...), libstdc++
   headers (`std::`, `__gthread_mutex_lock`, ...) and any other library source
@@ -333,9 +339,36 @@ _dbg$
 | `--cs` | Context-sensitive SVFG (SVF default; flag is descriptive) [default on] |
 | `--heap-model` | Heap object model (`ModelConsts`, `ModelArrays`) — opt-in |
 | `--include-stdlib` | Keep C++ std / C library / system-header / declaration-only library functions in the call graph [default: excluded] |
+| `--app-source-root <dir>` | Application source/header root for library classification (repeatable; relative to current directory) |
 | `--entry <name>` / `--entry-file <f>` | Call-graph entry functions (repeatable; demangled or mangled) |
 | `--filter-file <f>` | Hide functions matching the regexes in `<f>` (one per line), like library code: their direct user callees stay visible, their internal call tree does not |
 | `--format <tsv\|tree>` | Report layout: an indented ASCII call tree per entry (default) or tab-separated spans [default: tree] |
+
+#### Analyze Multiple Bitcode Modules
+
+Pass every module that belongs to the program as a positional input. The
+analyzer links them in memory before building SVF's program model, so there is
+no need to create a large intermediate `.bc` file with `llvm-link`:
+
+```bash
+LD_LIBRARY_PATH=/home/test/src/SVF/Release-build/lib:/usr/lib/llvm-21/lib \
+  ./svf-api-demo/build/clang_analyzer --dda \
+  build/module-a.bc build/module-b.bc build/module-c.bc
+```
+
+Use the same LLVM version and compatible target/compiler options when
+producing the input modules. Include modules containing relevant function and
+global-variable definitions; declarations alone do not provide SVF with the
+library implementation to analyze. Conflicting duplicate definitions can
+cause the in-memory link to fail.
+
+In-memory linking avoids the disk space and I/O needed for a linked bitcode
+artifact, but it does not make the analysis incremental: SVF still analyzes
+the combined program and its memory and runtime costs can remain high. For
+call-graph construction, `--dda` is often a useful faster alternative because
+it queries pointers feeding indirect callsites on demand. The default report
+path is based on the first input module; use `--output <file>` to choose it
+explicitly.
 
 ```bash
 # Default: flow-sensitive + context-sensitive (most complete & precise)

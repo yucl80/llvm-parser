@@ -15,9 +15,11 @@
 #include "Util/Options.h"
 
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/SourceMgr.h>
 
 #include <memory>
+#include <vector>
 
 using namespace SVF;
 
@@ -31,23 +33,55 @@ std::string analysisPtaName(const AnalysisConfig& config) {
     return "AndersenWaveDiff";
 }
 
-int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config) {
+int analyzeCallGraph(const std::vector<std::string>& bcFiles,
+                     const AnalysisConfig& config) {
+    if (bcFiles.empty()) {
+        llvm::errs() << "[ERROR] at least one bitcode file path is required\n";
+        return 1;
+    }
+
     // Keep SVF's statistics off stdout for *every* PTA this process creates —
     // including the Andersen pre-analysis, MemSSA and SVFG objects that DDA
     // builds internally during initialize() (per-PTA disablePrintStat() is too
     // late for those). Reports go to their own file, not stdout.
     Options::PStat.setValue(false);
 
-    llvm::SMDiagnostic err;
+    FunctionFilter filter;
     llvm::LLVMContext ctx;
-    std::unique_ptr<llvm::Module> mod = llvm::parseIRFile(bcFile, err, ctx);
-    if (!mod) {
-        llvm::errs() << "Failed to load bitcode file: " << bcFile << "\n";
-        return 1;
+    std::vector<std::unique_ptr<llvm::Module>> modules;
+    modules.reserve(bcFiles.size());
+    {
+        for (const std::string& bcFile : bcFiles) {
+            llvm::SMDiagnostic err;
+            std::unique_ptr<llvm::Module> mod =
+                llvm::parseIRFile(bcFile, err, ctx);
+            if (!mod) {
+                llvm::errs() << "Failed to load bitcode file: " << bcFile << "\n";
+                err.print("clang_analyzer", llvm::errs());
+                return 1;
+            }
+            modules.push_back(std::move(mod));
+        }
     }
-    llvm::Module& M = *mod;
+
+    // Merge in memory so declarations in one module resolve to definitions in
+    // another. This avoids writing a large linked bitcode file to disk.
+    std::unique_ptr<llvm::Module> linkedModule = std::move(modules.front());
+    for (size_t i = 1; i < modules.size(); ++i) {
+        if (llvm::Linker::linkModules(*linkedModule, std::move(modules[i]))) {
+            llvm::errs() << "[ERROR] failed to link bitcode module: "
+                         << bcFiles[i] << "\n";
+            return 1;
+        }
+    }
+    // Classify after linking so internal symbols renamed by the linker retain
+    // their debug locations and definition-site classification. This still
+    // runs before SVF adds ExtAPI stub bodies.
+    filter = FunctionFilter::build(*linkedModule, config.nameFilters,
+                                   config.appSourceRoots);
 
     llvm::errs() << "[Config] pta=" << analysisPtaName(config)
+                 << " modules=" << bcFiles.size()
                  << " context_sensitive=" << (config.contextSensitive ? "true" : "false")
                  << " heap_model=" << (config.heapModel ? "true" : "false")
                  << " exclude_std=" << (config.excludeStd ? "true" : "false")
@@ -59,21 +93,9 @@ int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config) {
         llvm::errs() << "[Config] Heap object model: ModelConsts=true, ModelArrays=true\n";
     }
 
-    // Classify each function by where it is *defined* in the input program:
-    //  - body-less declarations are imported library symbols (libc/libstdc++);
-    //  - definitions under the application's source tree are the program's own
-    //    code, definitions elsewhere (libstdc++/glibc headers and sources) are
-    //    library code;
-    //  - the application tree itself comes from the compile units.
-    // This must run BEFORE SVF builds its model: SVF's ExtAPI materializes stub
-    // bodies for modelled C library functions (strrchr, strchr, ...), after
-    // which an imported declaration would look like a definition.
-    // The user's name filters (--filter-file) are compiled into the same object.
-    const FunctionFilter filter =
-        FunctionFilter::build(M, config.nameFilters);
-
-    // 1. Build SVFModule
-    LLVMModuleSet::buildSVFModule(M);
+    // Build SVF's model from the in-memory linked module.
+    LLVMModuleSet::buildSVFModule(*linkedModule);
+    llvm::Module& M = *linkedModule;
 
     // 2. Build SVFIR
     SVFIRBuilder builder;

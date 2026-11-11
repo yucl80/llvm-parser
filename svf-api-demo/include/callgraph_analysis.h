@@ -36,7 +36,8 @@ struct AnalysisConfig {
     /// Hide library code from the output call graph so only the analyzed
     /// application's own call chains are reported. A function is library code
     /// when the file it is *defined* in is outside the application's source
-    /// tree (derived from the module's compile units) — this covers the C
+    /// tree (explicitly supplied with --app-source-root, or inferred from the
+    /// compile-unit directories as a best-effort fallback) — this covers the C
     /// library (strrchr, memcpy, ...), libstdc++/glibc headers (std::,
     /// __gthread_mutex_lock, ...) and any other linked-in library source,
     /// without enumerating function names. In addition:
@@ -49,6 +50,13 @@ struct AnalysisConfig {
     /// library functions (comparators, lambdas, functors) are still shown,
     /// grafted onto the caller that reached them.
     bool excludeStd = true;
+
+    /// Directories containing application source/header definitions. Repeat
+    /// --app-source-root for multiple roots. Relative paths are resolved from
+    /// the process working directory. Empty uses compile-unit directories as a
+    /// best-effort fallback; specify roots to distinguish application code
+    /// from third-party bitcode linked into the same program.
+    std::vector<std::string> appSourceRoots;
 
     /// Call-graph entry functions (demangled or mangled names).
     /// Empty => default entry "main".
@@ -83,9 +91,10 @@ struct AnalysisConfig {
 /// report's "#analysis pta=..." header line and the stderr config log).
 std::string analysisPtaName(const AnalysisConfig& config);
 
-/// Load the bitcode file at \p bcFile and run call graph analysis on it,
-/// writing the per-entry call graphs (spans) to a file.
-/// Returns 0 on success, non-zero if the bitcode cannot be loaded.
-int analyzeCallGraph(const std::string& bcFile, const AnalysisConfig& config);
+/// Load all bitcode files in \p bcFiles as one SVF program and run call graph
+/// analysis on them, writing the per-entry call graphs (spans) to a file.
+/// Returns 0 on success, non-zero if any bitcode file cannot be loaded.
+int analyzeCallGraph(const std::vector<std::string>& bcFiles,
+                     const AnalysisConfig& config);
 
 #endif // CALLGRAPH_ANALYSIS_H

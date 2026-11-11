@@ -1,12 +1,15 @@
 #include "callgraph_analysis.h"
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
 
 static void printUsage(const char* prog) {
-    llvm::errs() << "Usage: " << prog << " [options] <bitcode-file>\n"
+    llvm::errs() << "Usage: " << prog << " [options] <bitcode-file...>\n"
+                 << "                     Multiple modules are linked in memory; "
+                    "no llvm-link output file is required.\n"
                  << "Options:\n"
                  << "  (default)          Flow-sensitive + context-sensitive\n"
                  << "                     (most complete & precise call graph)\n"
@@ -39,6 +42,9 @@ static void printUsage(const char* prog) {
                  << "                     own sources: C library, std::/__gnu_cxx::,\n"
                  << "                     __cxa_*/__gxx_* runtime ABI)\n"
                  << "                     [default: excluded]\n"
+                 << "  --app-source-root <dir>\n"
+                 << "                     Application source/header root (repeatable);\n"
+                 << "                     relative paths use the current directory\n"
                  << "  --entry <name>     Call-graph entry function (repeatable; demangled or mangled)\n"
                  << "  --entry-file <f>   File listing entry names, one per line\n"
                  << "  --filter-file <f>  Hide functions matching the regular expressions in\n"
@@ -51,8 +57,7 @@ static void printUsage(const char* prog) {
                  << "                     with [indirect]/[cycle] markers and call-site\n"
                  << "                     locations (default), or tab-separated spans\n"
                  << "  --output <file>    Write the call-graph report to <file>\n"
-                 << "                     (default <bitcode>.callgraph.tree, or\n"
-                 << "                     <bitcode>.callgraph.tsv with --format tsv)\n";
+                 << "                     (default based on the first bitcode input)\n";
 }
 
 /// Trim leading/trailing blanks and tabs, so indented patterns and stray
@@ -87,9 +92,9 @@ static bool readPatternFile(const std::string& path,
     return true;
 }
 
-static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
+static AnalysisConfig parseFlags(int argc, char** argv,
+                                 std::vector<std::string>& bcFiles) {
     AnalysisConfig config;
-    bcIdx = -1;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--fs") == 0) {
@@ -128,6 +133,23 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
             config.heapModel = false;
         } else if (strcmp(argv[i], "--include-stdlib") == 0) {
             config.excludeStd = false;
+        } else if (strcmp(argv[i], "--app-source-root") == 0) {
+            if (i + 1 >= argc) {
+                llvm::errs() << "[ERROR] --app-source-root requires a directory\n";
+                exit(1);
+            }
+            const std::string root = argv[++i];
+            std::error_code ec;
+            if (!std::filesystem::is_directory(root, ec)) {
+                llvm::errs() << "[ERROR] application source root is not a "
+                                "directory: "
+                             << root;
+                if (ec)
+                    llvm::errs() << " (" << ec.message() << ")";
+                llvm::errs() << "\n";
+                exit(1);
+            }
+            config.appSourceRoots.push_back(root);
         } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
             config.entries.push_back(argv[++i]);
         } else if (strcmp(argv[i], "--entry-file") == 0 && i + 1 < argc) {
@@ -166,8 +188,7 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
             printUsage(argv[0]);
             exit(0);
         } else {
-            // Assume it's the bitcode file path
-            bcIdx = i;
+            bcFiles.emplace_back(argv[i]);
         }
     }
 
@@ -175,13 +196,13 @@ static AnalysisConfig parseFlags(int argc, char** argv, int& bcIdx) {
 }
 
 int main(int argc, char** argv) {
-    int bcIdx;
-    AnalysisConfig config = parseFlags(argc, argv, bcIdx);
+    std::vector<std::string> bcFiles;
+    AnalysisConfig config = parseFlags(argc, argv, bcFiles);
 
-    if (bcIdx == -1) {
-        llvm::errs() << "[ERROR] bitcode file path is required\n";
+    if (bcFiles.empty()) {
+        llvm::errs() << "[ERROR] at least one bitcode file path is required\n";
         exit(1);
     }    
 
-    return analyzeCallGraph(argv[bcIdx] , config);
+    return analyzeCallGraph(bcFiles, config);
 }
