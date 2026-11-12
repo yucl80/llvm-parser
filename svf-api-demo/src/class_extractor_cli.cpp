@@ -13,7 +13,7 @@
 // the requested format, independently of which backend produced it.
 //===----------------------------------------------------------------------===//
 
-#include "class_report.h"
+#include "class_extractor_report.h"
 
 #include <cstdio>
 #include <cstdlib>

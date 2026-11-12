@@ -20,7 +20,7 @@
 // resulting classinfo::ClassReport itself.
 //===----------------------------------------------------------------------===//
 
-#include "class_report.h"
+#include "class_extractor_report.h"
 
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/BasicBlock.h>

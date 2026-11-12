@@ -1,48 +1,49 @@
 //===----------------------------------------------------------------------===//
-// entry_extractor.cpp — list the entry functions of an LLVM bitcode module.
+// entry_extractor.cpp — list the entry functions of LLVM bitcode modules.
 //
-// Usage: entry_extractor [options] <bitcode-file>
+// Usage: entry_extractor [options] <bitcode-file> [<bitcode-file> ...]
 //
 // "Entry function" has several readings; --mode selects one:
 //   roots (default)  Functions that can be triggered from outside the module's
-//                    own direct call graph:
-//                      * main / svf.main;
+//                    own reachable direct call graph:
+//                      * program entries (main, svf.main, framework entry
+//                        names supplied with --entry-name);
 //                      * framework-registered handlers (see below);
-//                      * functions with no direct caller in this module:
+//                      * functions with no reachable direct caller:
 //                        uncalled functions ("no-caller") and functions whose
 //                        address escapes ("callback").
 //                    Recursion and mutual recursion are handled with SCCs.
 //   routes           Only the framework-registered handlers.
-//   exported         Every function with a body that is visible to other
-//                    modules (non-local linkage): the module's public API.
+//   exported         Every defined function whose linkage AND visibility make
+//                    it visible to other modules (plus alias/ifunc targets).
 //   all              Every function with a body (inspection / debugging).
 //
-// A "framework-registered handler" is recognised in four ways:
+// A "framework-registered handler" is recognised in several ways:
 //   route-handler       A constant dispatch table pairing a label with a
-//                       function pointer. Labels may be C strings (including
-//                       merged string pools / GEPs into them), string views or
-//                       integral keys (HTTP methods, opcodes, message ids).
-//                       The pointer may be plain, bitcast, a C++
-//                       pointer-to-member (ptrtoint), a GlobalAlias, or live
-//                       in another global constant referenced by the table.
+//                       function pointer. Labels may be C strings (UTF-8,
+//                       merged string pools / GEPs, wide strings), integral
+//                       keys (including negative / 64-bit opcodes) or floats.
 //   registered-handler A function pointer stored or passed to a registration
-//                       API at run time (router.add, std::function, subscribe,
-//                       pthread_create, a global constructor's init call, ...).
-//   annotated          A function listed in @llvm.global.annotations.
-//   retained           A function listed in @llvm.used / @llvm.compiler.used.
+//                       API at run time. A local value-flow resolver follows
+//                       loads, phi/select, function-returned pointers,
+//                       aggregate constants, GEPs and memcpy-style copies.
+//   type-erased        Lambda / std::function / std::bind targets recovered
+//                       from the standard library's invoker chain.
+//   annotated          @llvm.global.annotations or a function's !annotation.
+//   retained           @llvm.used / @llvm.compiler.used / @llvm.global_dtors.
+//   section-handler    A function pointer in a custom section (.init_array,
+//                       linker sets, ...).
+//   aliased            Target of an externally visible GlobalAlias / ifunc.
+//   virtual-handler    Opt-in (--virtual-handlers): functions in _ZTV* tables.
 //
-// Still out of reach at the IR level (the analyzer's SVF pointer analysis is
-// needed): type-erased completion handlers whose callable never appears as a
-// function pointer (a lambda/std::function closure), and virtual
-// pointer-to-member functions encoded as vtable indices rather than addresses.
+// Output is a plain name list by default (feed it to
+// `clang_analyzer --entry-file <file>`), or structured JSON with --format json
+// carrying mangled/demangled names, source location and signature.
+// Declarations without a body are never printed: they are library calls.
 //
-// --verbose appends a tab-separated reason and, when available, the trigger
-// (route label, registration call, annotation) that made the function an
-// entry. Without --verbose one name per line is printed, in the module's
-// mangled spelling (or demangled with --demangle); the output can be fed
-// directly to `clang_analyzer --entry-file <file>`. Declarations without a
-// body are never printed: they are library calls, not entry points defined in
-// this bitcode.
+// Optimised (-O2/LTO) bitcode may have folded the constant tables and
+// registration calls this scanner relies on; --verbose / JSON emit a warning.
+// Prefer -O0 / pre-LTO bitcode when completeness matters.
 //===----------------------------------------------------------------------===//
 
 #include "function_filter.h"
@@ -54,25 +55,32 @@
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalAlias.h>
+#include <llvm/IR/GlobalIFunc.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/Use.h>
 #include <llvm/IR/User.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -82,6 +90,7 @@
 namespace {
 
 enum class Mode { Roots, Routes, Exported, All };
+enum class OutputFormat { Names, Json };
 
 const char* modeName(Mode mode) {
     switch (mode) {
@@ -95,34 +104,62 @@ const char* modeName(Mode mode) {
 
 struct Options {
     Mode mode = Mode::Roots;
+    OutputFormat format = OutputFormat::Names;
     bool demangle = false;
     bool verbose = false;
     bool includeLibrary = false;
+    bool allLabels = false;
+    bool virtualHandlers = false;
+    bool typeErased = true;
+    bool sectionHandlers = true;
+    bool reachableRoots = true;
     std::string outputFile;
-    std::string bcFile;
+    std::string filterFile;
+    std::vector<std::string> bcFiles;
+    std::vector<std::string> appSourceRoots;
+    std::vector<std::string> namePatterns;
+    std::vector<std::string> extraEntryNames;
 };
 
 void printUsage(const char* prog) {
     llvm::errs()
-        << "Usage: " << prog << " [options] <bitcode-file>\n"
+        << "Usage: " << prog
+        << " [options] <bitcode-file> [<bitcode-file> ...]\n"
         << "Options:\n"
         << "  --mode <roots|routes|exported|all>\n"
         << "                     Which functions count as entries:\n"
-        << "                       roots    - main, framework-registered\n"
+        << "                       roots    - program entries, framework\n"
         << "                                  handlers and functions with no\n"
-        << "                                  direct caller [default]\n"
+        << "                                  reachable direct caller [default]\n"
         << "                       routes   - only framework-registered\n"
         << "                                  handlers (route tables, runtime\n"
         << "                                  registration, annotations)\n"
         << "                       exported- every defined function visible\n"
         << "                                  to other modules\n"
         << "                       all      - every function with a body\n"
-        << "  --include-library  Keep every address-taken callback in roots\n"
-        << "                     mode, including library/framework ones\n"
-        << "  --demangle         Print demangled C++ names\n"
+        << "  --format <names|json>\n"
+        << "                     Plain name list [default] or structured JSON\n"
+        << "                     with mangled name, location and signature\n"
+        << "  --include-library  Keep library/framework callbacks as entries\n"
+        << "  --demangle         Print demangled C++ names (names format)\n"
         << "  --verbose          Append reason and trigger (tab-separated)\n"
         << "                     to each name and print a summary on stderr\n"
-        << "  --output <file>    Write names to <file> instead of stdout\n"
+        << "  --output <file>    Write to <file> instead of stdout\n"
+        << "  --app-source-root <dir>\n"
+        << "                     Application source root (repeatable); enables\n"
+        << "                     definition-site library classification\n"
+        << "  --filter-file <f> One ECMAScript regex per line; matching\n"
+        << "                     functions are excluded from the report\n"
+        << "  --entry-name <n>  Extra program-entry name (repeatable; a\n"
+        << "                     trailing '*' makes it a prefix match)\n"
+        << "  --all-labels      Keep integer/float labels alongside strings\n"
+        << "                     and scan labels across basic blocks\n"
+        << "  --virtual-handlers\n"
+        << "                     Report functions referenced by _ZTV* tables\n"
+        << "  --no-type-erased  Disable lambda/std::function target recovery\n"
+        << "  --no-section-handlers\n"
+        << "                     Disable custom-section (.init_array) handlers\n"
+        << "  --legacy-roots    Count dead-code direct callers as callers\n"
         << "  --help             Show this help\n";
 }
 
@@ -133,7 +170,7 @@ void printUsage(const char* prog) {
 /// Why a function was recognised as a framework entry. Ordered by confidence:
 /// a route table beats a runtime registration, which beats a metadata hint.
 enum class HandlerKind { RouteTable = 0, Registration = 1, Annotation = 2,
-                         Retained = 3 };
+                         Retained = 3, Section = 4, Alias = 5, Virtual = 6 };
 
 const char* kindReason(HandlerKind kind) {
     switch (kind) {
@@ -141,6 +178,9 @@ const char* kindReason(HandlerKind kind) {
     case HandlerKind::Registration: return "registered-handler";
     case HandlerKind::Annotation: return "annotated";
     case HandlerKind::Retained: return "retained";
+    case HandlerKind::Section: return "section-handler";
+    case HandlerKind::Alias: return "aliased";
+    case HandlerKind::Virtual: return "virtual-handler";
     }
     return "route-handler";
 }
@@ -161,9 +201,80 @@ std::string sanitize(std::string s) {
     return s;
 }
 
-/// I8 bytes of a string constant. The initializer may be a ConstantDataArray
-/// directly or behind a global (the usual `@.str` form), and does not have to
-/// be NUL-terminated: a std::string_view / string pool is a valid label too.
+/// Minimal JSON string escaping; the report contains user-controlled symbols.
+std::string jsonEscape(llvm::StringRef s) {
+    std::string out = "\"";
+    char buf[7];
+    for (const unsigned char c : s) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+    }
+    out += '"';
+    return out;
+}
+
+void appendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+}
+
+/// Reject arbitrary binary data that happens to contain high bytes.
+bool validUtf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) { ++i; continue; }
+        unsigned need = 0;
+        uint32_t cp = 0;
+        if (c >= 0xc2 && c <= 0xdf) { need = 1; cp = c & 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { need = 2; cp = c & 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { need = 3; cp = c & 0x07; }
+        else return false;
+        if (i + need >= s.size()) return false;
+        for (unsigned k = 1; k <= need; ++k) {
+            const unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3f);
+        }
+        if ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000) ||
+            cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+            return false;
+        i += need + 1;
+    }
+    return true;
+}
+
+/// Bytes of a string constant. Handles plain i8 ConstantDataArray, a
+/// ConstantArray of i8 elements, wide (i16/i32) strings encoded as UTF-8, and
+/// any of them behind a global (`@.str`). A GEP/string-pool label does not
+/// have to be NUL-terminated.
 std::string constantBytes(const llvm::Constant* C) {
     if (!C)
         return {};
@@ -173,49 +284,119 @@ std::string constantBytes(const llvm::Constant* C) {
         C = GV->getInitializer();
     }
     const llvm::Value* stripped = C->stripPointerCasts();
-    const auto* data = llvm::dyn_cast<llvm::ConstantDataArray>(stripped);
-    if (!data || !data->getElementType()->isIntegerTy(8))
-        return {};
-    std::string bytes;
-    bytes.reserve(data->getNumElements());
-    for (unsigned i = 0; i < data->getNumElements(); ++i)
-        bytes.push_back(static_cast<char>(data->getElementAsInteger(i) & 0xff));
-    return bytes;
+
+    if (const auto* data =
+            llvm::dyn_cast<llvm::ConstantDataArray>(stripped)) {
+        llvm::Type* element = data->getElementType();
+        if (element->isIntegerTy(8)) {
+            std::string bytes;
+            bytes.reserve(data->getNumElements());
+            for (unsigned i = 0; i < data->getNumElements(); ++i)
+                bytes.push_back(
+                    static_cast<char>(data->getElementAsInteger(i) & 0xff));
+            return bytes;
+        }
+        // wchar_t / char16_t / char32_t literals. Only plausible text is
+        // accepted: a terminator (or a short array), no controls/surrogates.
+        if (!element->isIntegerTy(16) && !element->isIntegerTy(32))
+            return {};
+        const unsigned n = data->getNumElements();
+        if (n > 256)
+            return {};
+        bool hasTerminator = false;
+        for (unsigned i = 0; i < n; ++i)
+            if (data->getElementAsInteger(i) == 0) {
+                hasTerminator = true;
+                break;
+            }
+        if (!hasTerminator && n > 32)
+            return {};
+        std::string out;
+        for (unsigned i = 0; i < n; ++i) {
+            const uint64_t cp = data->getElementAsInteger(i);
+            if (cp == 0)
+                break;
+            if (cp < 0x20 || cp > 0x10ffff ||
+                (cp >= 0xd800 && cp <= 0xdfff))
+                return {};
+            appendUtf8(out, static_cast<uint32_t>(cp));
+        }
+        return out;
+    }
+
+    if (const auto* array = llvm::dyn_cast<llvm::ConstantArray>(stripped)) {
+        if (!array->getType()->getElementType()->isIntegerTy(8))
+            return {};
+        std::string bytes;
+        bytes.reserve(array->getNumOperands());
+        for (unsigned i = 0; i < array->getNumOperands(); ++i) {
+            const auto* CI =
+                llvm::dyn_cast<llvm::ConstantInt>(array->getOperand(i));
+            if (!CI)
+                return {};
+            bytes.push_back(static_cast<char>(CI->getZExtValue() & 0xff));
+        }
+        return bytes;
+    }
+    return {};
 }
 
-/// Printable C string starting at \p offset, stopping at the first NUL.
-/// String pools concatenate several literals with NUL separators; a GEP into
-/// such a pool selects one of them by offset.
+/// Printable string starting at \p offset, stopping at the first NUL.
+/// Non-ASCII UTF-8 bytes are kept (a Chinese route label is a valid label);
+/// binary data with high bytes is rejected instead of becoming a label.
 std::string stringAt(const std::string& bytes, uint64_t offset) {
     if (offset >= bytes.size())
         return {};
     std::string out;
-    for (uint64_t i = offset; i < bytes.size() && out.size() < 96; ++i) {
+    for (uint64_t i = offset; i < bytes.size() && out.size() < 256; ++i) {
         const unsigned char c = static_cast<unsigned char>(bytes[i]);
         if (c == 0)
             break;
-        if (c < 0x20 || c > 0x7e)
+        if (c < 0x20 || c == 0x7f)
             return {};
         out.push_back(static_cast<char>(c));
     }
-    return out;
+    return validUtf8(out) ? out : std::string();
 }
 
 /// Extract a dispatch-table label from a constant. Strings are returned as-is,
-/// integral keys as "#<value>". Returns empty for anything else.
+/// integral keys as "#<value>" (signed, so negative opcodes survive), floats as
+/// "#f<value>". Returns empty for anything else.
 std::string extractLabel(const llvm::Constant* C, const llvm::DataLayout& DL,
                          unsigned depth = 0) {
-    if (!C || depth > 4)
+    if (!C || depth > 5)
         return {};
     if (llvm::isa<llvm::ConstantDataArray>(C) ||
-        llvm::isa<llvm::GlobalVariable>(C))
-        return stringAt(constantBytes(C), 0);
-    if (const auto* CI = llvm::dyn_cast<llvm::ConstantInt>(C)) {
-        // Vtable offsets / negative thunk adjustments are huge unsigned values;
-        // they are padding, not dispatch keys.
-        if (CI->getBitWidth() > 64 || CI->getZExtValue() > 0x7fffffffULL)
+        llvm::isa<llvm::ConstantArray>(C) ||
+        llvm::isa<llvm::GlobalVariable>(C)) {
+        const std::string text = stringAt(constantBytes(C), 0);
+        if (!text.empty())
+            return text;
+        // Never descend into a global's aggregate operands here: RTTI objects
+        // carry type-name strings that would turn every vtable into a table.
+        if (llvm::isa<llvm::GlobalVariable>(C))
             return {};
-        return "#" + std::to_string(CI->getZExtValue());
+    }
+    if (const auto* CI = llvm::dyn_cast<llvm::ConstantInt>(C)) {
+        if (CI->getBitWidth() > 64)
+            return {};
+        // Huge unsigned values are vtable offsets / thunk adjustments, not
+        // dispatch keys. Everything else (including i32 -1 and 64-bit ids) is
+        // a plausible opcode or message id.
+        if (CI->getZExtValue() >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return {};
+        const int64_t value = CI->getSExtValue();
+        if (value < static_cast<int64_t>(std::numeric_limits<int32_t>::min()))
+            return {};
+        return "#" + std::to_string(value);
+    }
+    if (const auto* CFP = llvm::dyn_cast<llvm::ConstantFP>(C)) {
+        if (!CFP->getValueAPF().isFinite())
+            return {};
+        std::ostringstream os;
+        os << CFP->getValueAPF().convertToDouble();
+        return "#f" + os.str();
     }
     if (const auto* alias = llvm::dyn_cast<llvm::GlobalAlias>(C))
         return extractLabel(alias->getAliasee(), DL, depth + 1);
@@ -234,7 +415,26 @@ std::string extractLabel(const llvm::Constant* C, const llvm::DataLayout& DL,
         case llvm::Instruction::PtrToInt:
         case llvm::Instruction::IntToPtr:
         case llvm::Instruction::AddrSpaceCast:
+        case llvm::Instruction::ZExt:
+        case llvm::Instruction::SExt:
+        case llvm::Instruction::Trunc:
             return extractLabel(CE->getOperand(0), DL, depth + 1);
+        // Relative relocations / tagged pointers: a label may sit behind a
+        // constant arithmetic expression.
+        case llvm::Instruction::Add:
+        case llvm::Instruction::Sub:
+        case llvm::Instruction::And:
+        case llvm::Instruction::Or:
+        case llvm::Instruction::Xor:
+            for (const llvm::Use& U : CE->operands())
+                if (const auto* operand =
+                        llvm::dyn_cast<llvm::Constant>(U.get())) {
+                    const std::string label =
+                        extractLabel(operand, DL, depth + 1);
+                    if (!label.empty())
+                        return label;
+                }
+            return {};
         default:
             return {};
         }
@@ -242,7 +442,8 @@ std::string extractLabel(const llvm::Constant* C, const llvm::DataLayout& DL,
     return {};
 }
 
-std::string joinLabels(const std::vector<std::string>& labels) {
+std::string joinLabels(const std::vector<std::string>& labels,
+                       bool allLabels = false) {
     std::vector<std::string> strings, numbers;
     for (const std::string& label : labels) {
         std::vector<std::string>& bucket =
@@ -250,15 +451,24 @@ std::string joinLabels(const std::vector<std::string>& labels) {
         if (std::find(bucket.begin(), bucket.end(), label) == bucket.end())
             bucket.push_back(label);
     }
-    // A human-readable path/method beats the integral padding fields that
-    // structs and PMF pairs carry; integer keys are still reported when the
-    // table has no string label at all.
-    const std::vector<std::string>& chosen = strings.empty() ? numbers : strings;
+    // By default a readable path/method beats integral padding, and integer
+    // keys are used when the table has no string label. --all-labels keeps
+    // both families and raises the length limits.
+    std::vector<std::string> chosen;
+    const size_t maxStrings = allLabels ? 8 : 4;
+    for (size_t i = 0; i < strings.size() && i < maxStrings; ++i)
+        chosen.push_back(strings[i]);
+    if (allLabels || strings.empty())
+        for (size_t i = 0; i < numbers.size() && i < (allLabels ? 4 : 4); ++i)
+            chosen.push_back(numbers[i]);
+    const size_t maxChars = allLabels ? 240 : 120;
     std::string out;
-    for (size_t i = 0; i < chosen.size() && i < 4 && out.size() < 120; ++i) {
+    for (const std::string& label : chosen) {
+        if (out.size() >= maxChars)
+            break;
         if (!out.empty())
             out += "|";
-        out += sanitize(chosen[i]);
+        out += sanitize(label);
     }
     return out;
 }
@@ -367,56 +577,123 @@ bool isCompilerInitStub(const std::string& raw) {
            raw.rfind("__cxx_global_var_init", 0) == 0;
 }
 
-/// Collect functions referenced by a value: a plain function pointer, a
-/// bitcast / ptrtoint expression, a GlobalAlias, or a global whose initializer
-/// is exactly such a pointer. Only unary conversion chains are followed —
-/// walking an arbitrary aggregate (std::map internals, vtables) would register
-/// unrelated code.
-void collectFunctionRefs(const llvm::Value* V, unsigned depth,
-                         std::vector<const llvm::Function*>& out) {
-    if (!V || depth > 4)
-        return;
-    if (const auto* F = llvm::dyn_cast<llvm::Function>(V)) {
-        out.push_back(F);
-        return;
-    }
-    if (const auto* alias = llvm::dyn_cast<llvm::GlobalAlias>(V)) {
-        collectFunctionRefs(alias->getAliasee(), depth + 1, out);
-        return;
-    }
-    if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(V)) {
-        if (!GV->hasInitializer())
-            return;
-        const llvm::Value* stripped = GV->getInitializer()->stripPointerCasts();
-        if (llvm::isa<llvm::Function>(stripped) ||
-            llvm::isa<llvm::ConstantExpr>(stripped) ||
-            llvm::isa<llvm::GlobalAlias>(stripped))
-            collectFunctionRefs(stripped, depth + 1, out);
-        return;
-    }
-    if (const auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
-        if (CE->getNumOperands() != 1)
-            return;
-        switch (CE->getOpcode()) {
-        case llvm::Instruction::BitCast:
-        case llvm::Instruction::PtrToInt:
-        case llvm::Instruction::IntToPtr:
-        case llvm::Instruction::AddrSpaceCast:
-        case llvm::Instruction::ZExt:
-        case llvm::Instruction::SExt:
-        case llvm::Instruction::Trunc:
-            collectFunctionRefs(CE->getOperand(0), depth + 1, out);
-            return;
-        default:
-            return;
+/// Program-entry symbols beyond main: platform, plugin and fuzzer entry
+/// points, plus user-supplied names (exact or "prefix*").
+bool isFrameworkEntryName(llvm::StringRef raw,
+                          const std::vector<std::string>& extra) {
+    static const char* kExact[] = {
+        "main", "svf.main", "wmain", "WinMain", "wWinMain", "DllMain",
+        "JNI_OnLoad", "LLVMFuzzerTestOneInput", "SDL_main", "module_init"};
+    for (const char* name : kExact)
+        if (raw == name)
+            return true;
+    static const char* kPrefixes[] = {"PyInit_", "luaopen_", "napi_",
+                                      "JNI_OnLoad_"};
+    for (const char* prefix : kPrefixes)
+        if (raw.starts_with(prefix))
+            return true;
+    for (const std::string& name : extra) {
+        if (name.empty())
+            continue;
+        if (name.back() == '*') {
+            if (raw.starts_with(llvm::StringRef(name).drop_back()))
+                return true;
+        } else if (raw == name) {
+            return true;
         }
     }
-    if (const auto* I = llvm::dyn_cast<llvm::Instruction>(V)) {
-        if ((llvm::isa<llvm::CastInst>(I) ||
-             llvm::isa<llvm::GEPOperator>(I)) &&
-            I->getNumOperands() >= 1)
-            collectFunctionRefs(I->getOperand(0), depth + 1, out);
+    return false;
+}
+
+const llvm::Function* resolveAliaseeFunction(const llvm::Constant* C,
+                                            unsigned depth = 0) {
+    if (!C || depth > 6)
+        return nullptr;
+    if (const auto* F = llvm::dyn_cast<llvm::Function>(C))
+        return F;
+    if (const auto* alias = llvm::dyn_cast<llvm::GlobalAlias>(C))
+        return resolveAliaseeFunction(alias->getAliasee(), depth + 1);
+    if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(C))
+        return GV->hasInitializer()
+                   ? resolveAliaseeFunction(GV->getInitializer(), depth + 1)
+                   : nullptr;
+    if (const auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(C))
+        return CE->getNumOperands()
+                   ? resolveAliaseeFunction(
+                         llvm::dyn_cast<llvm::Constant>(CE->getOperand(0)),
+                         depth + 1)
+                   : nullptr;
+    return nullptr;
+}
+
+/// A symbol is exported only when both linkage and visibility allow it.
+bool isExternallyVisible(const llvm::GlobalValue& GV) {
+    if (GV.hasLocalLinkage() || GV.hasAvailableExternallyLinkage())
+        return false;
+    return GV.getVisibility() == llvm::GlobalValue::DefaultVisibility;
+}
+
+/// Functions reachable through externally visible aliases / ifuncs. Their
+/// own (possibly internal) definitions must still be reported under the name
+/// the downstream analyzer can resolve.
+std::unordered_set<const llvm::Function*>
+collectAliasTargets(const llvm::Module& M) {
+    std::unordered_set<const llvm::Function*> out;
+    for (const llvm::GlobalAlias& A : M.aliases()) {
+        if (!isExternallyVisible(A))
+            continue;
+        if (const llvm::Function* F = resolveAliaseeFunction(A.getAliasee()))
+            out.insert(F);
     }
+    for (const llvm::GlobalIFunc& IF : M.ifuncs()) {
+        if (!isExternallyVisible(IF))
+            continue;
+        if (const auto* F =
+                llvm::dyn_cast<llvm::Function>(IF.getResolver()))
+            out.insert(F);
+    }
+    return out;
+}
+
+std::string metadataText(const llvm::MDNode* node) {
+    if (!node)
+        return {};
+    for (const llvm::MDOperand& operand : node->operands())
+        if (const auto* text =
+                llvm::dyn_cast<llvm::MDString>(operand.get()))
+            return text->getString().str();
+    return {};
+}
+
+std::string functionSignature(const llvm::Function& F) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    F.getFunctionType()->print(os);
+    os.flush();
+    return text;
+}
+
+bool isMemcpyLike(const llvm::CallBase* CB) {
+    const llvm::Function* callee = CB->getCalledFunction();
+    if (!callee)
+        return false;
+    const llvm::StringRef name = callee->getName();
+    return name.starts_with("llvm.memcpy") ||
+           name.starts_with("llvm.memmove") || name == "memcpy" ||
+           name == "memmove";
+}
+
+/// Keys under which a store to (or a load from) a pointer may be indexed: the
+/// pointer itself and every enclosing GEP base, with casts stripped.
+void pointerKeys(const llvm::Value* P, std::vector<const llvm::Value*>& out,
+                 unsigned depth = 0) {
+    if (!P || depth > 6)
+        return;
+    const llvm::Value* key = P->stripPointerCasts();
+    if (std::find(out.begin(), out.end(), key) == out.end())
+        out.push_back(key);
+    if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(P))
+        pointerKeys(gep->getPointerOperand(), out, depth + 1);
 }
 
 /// Collect functions from a constant expression tree, including globals
@@ -449,13 +726,208 @@ void collectConstantFunctions(const llvm::Constant* C, unsigned depth,
 }
 
 //===----------------------------------------------------------------------===//
+// Lightweight IR value flow. A pointer analysis (SVF) would be more complete,
+// but these local, flow-insensitive facts cover the registration shapes that
+// appear in practice without making the standalone tool depend on SVF:
+//   * store / load through allocas, globals and GEPs;
+//   * phi / select / insertvalue / extractvalue;
+//   * a function pointer returned by another function, or forwarded by a
+//     wrapper through its parameters;
+//   * constant aggregates and memcpy-style table copies.
+//===----------------------------------------------------------------------===//
+
+struct ValueFlow {
+    std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>>
+        stores;
+    std::unordered_map<const llvm::Function*,
+                       std::vector<const llvm::Value*>>
+        returns;
+    std::unordered_map<const llvm::Argument*,
+                       std::vector<const llvm::Value*>>
+        args;
+};
+
+ValueFlow buildValueFlow(const llvm::Module& M) {
+    ValueFlow flow;
+    for (const llvm::Function& F : M) {
+        if (F.isDeclaration() || F.isIntrinsic())
+            continue;
+        for (const llvm::Instruction& I : llvm::instructions(F)) {
+            if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+                std::vector<const llvm::Value*> keys;
+                pointerKeys(SI->getPointerOperand(), keys);
+                for (const llvm::Value* key : keys)
+                    flow.stores[key].push_back(SI->getValueOperand());
+            } else if (const auto* RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+                if (RI->getReturnValue())
+                    flow.returns[&F].push_back(RI->getReturnValue());
+            } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+                if (const auto* callee = llvm::dyn_cast<llvm::Function>(
+                        CB->getCalledOperand()->stripPointerCasts())) {
+                    const unsigned n = std::min<unsigned>(
+                        CB->arg_size(),
+                        static_cast<unsigned>(callee->arg_size()));
+                    for (unsigned a = 0; a < n; ++a)
+                        flow.args[callee->getArg(a)].push_back(
+                            CB->getArgOperand(a));
+                }
+                if (isMemcpyLike(CB) && CB->arg_size() >= 2) {
+                    std::vector<const llvm::Value*> keys;
+                    pointerKeys(CB->getArgOperand(0), keys);
+                    for (const llvm::Value* key : keys)
+                        flow.stores[key].push_back(CB->getArgOperand(1));
+                }
+            }
+        }
+    }
+    return flow;
+}
+
+void collectFunctionRefs(const llvm::Value* V, unsigned depth,
+                         const ValueFlow& flow,
+                         std::unordered_set<const llvm::Value*>& seen,
+                         std::vector<const llvm::Function*>& out);
+
+/// Resolve everything that may have been written through a pointer.
+void collectStoredRefs(const llvm::Value* P, unsigned depth,
+                       const ValueFlow& flow,
+                       std::unordered_set<const llvm::Value*>& seen,
+                       std::vector<const llvm::Function*>& out) {
+    if (!P || depth > 8)
+        return;
+    std::vector<const llvm::Value*> keys;
+    pointerKeys(P, keys);
+    for (const llvm::Value* key : keys) {
+        const auto stores = flow.stores.find(key);
+        if (stores != flow.stores.end())
+            for (const llvm::Value* stored : stores->second)
+                collectFunctionRefs(stored, depth + 1, flow, seen, out);
+        if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(key)) {
+            const llvm::StringRef name = GV->getName();
+            if (GV->hasInitializer() && !name.starts_with("llvm.") &&
+                !isRuntimeMetadataGlobal(name)) {
+                std::unordered_set<const llvm::Constant*> visiting;
+                collectConstantFunctions(GV->getInitializer(), 0, visiting,
+                                         out);
+            }
+        }
+    }
+}
+
+/// Collect functions referenced by a value, following the local value flow.
+void collectFunctionRefs(const llvm::Value* V, unsigned depth,
+                         const ValueFlow& flow,
+                         std::unordered_set<const llvm::Value*>& seen,
+                         std::vector<const llvm::Function*>& out) {
+    if (!V || depth > 8)
+        return;
+    if (const auto* alias = llvm::dyn_cast<llvm::GlobalAlias>(V)) {
+        collectFunctionRefs(alias->getAliasee(), depth + 1, flow, seen, out);
+        return;
+    }
+    if (const auto* ifunc = llvm::dyn_cast<llvm::GlobalIFunc>(V)) {
+        collectFunctionRefs(ifunc->getResolver(), depth + 1, flow, seen, out);
+        return;
+    }
+    const llvm::Value* stripped = V->stripPointerCasts();
+    if (!seen.insert(stripped).second)
+        return;
+
+    if (const auto* F = llvm::dyn_cast<llvm::Function>(stripped)) {
+        out.push_back(F);
+        return;
+    }
+    if (const auto* Arg = llvm::dyn_cast<llvm::Argument>(stripped)) {
+        const auto it = flow.args.find(Arg);
+        if (it != flow.args.end())
+            for (const llvm::Value* actual : it->second)
+                collectFunctionRefs(actual, depth + 1, flow, seen, out);
+        return;
+    }
+    if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(stripped)) {
+        const llvm::StringRef name = GV->getName();
+        // A vtable/RTTI store must not register every virtual override.
+        if (name.starts_with("llvm.") || isRuntimeMetadataGlobal(name))
+            return;
+        collectStoredRefs(GV, depth, flow, seen, out);
+        return;
+    }
+    if (const auto* C = llvm::dyn_cast<llvm::Constant>(stripped)) {
+        if (!llvm::isa<llvm::ConstantData>(C) &&
+            !llvm::isa<llvm::ConstantAggregateZero>(C) &&
+            !llvm::isa<llvm::ConstantPointerNull>(C))
+            for (const llvm::Use& U : C->operands())
+                if (const auto* child =
+                        llvm::dyn_cast<llvm::Constant>(U.get()))
+                    collectFunctionRefs(child, depth + 1, flow, seen, out);
+        return;
+    }
+
+    const auto* I = llvm::dyn_cast<llvm::Instruction>(stripped);
+    if (!I)
+        return;
+    if (const auto* LI = llvm::dyn_cast<llvm::LoadInst>(I)) {
+        collectStoredRefs(LI->getPointerOperand(), depth, flow, seen, out);
+        return;
+    }
+    if (const auto* PN = llvm::dyn_cast<llvm::PHINode>(I)) {
+        for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+            collectFunctionRefs(PN->getIncomingValue(i), depth + 1, flow,
+                                seen, out);
+        return;
+    }
+    if (const auto* Sel = llvm::dyn_cast<llvm::SelectInst>(I)) {
+        collectFunctionRefs(Sel->getTrueValue(), depth + 1, flow, seen, out);
+        collectFunctionRefs(Sel->getFalseValue(), depth + 1, flow, seen, out);
+        return;
+    }
+    if (const auto* CI = llvm::dyn_cast<llvm::CallInst>(I)) {
+        if (const auto* callee = llvm::dyn_cast_or_null<llvm::Function>(
+                CI->getCalledOperand()->stripPointerCasts())) {
+            const auto it = flow.returns.find(callee);
+            if (it != flow.returns.end())
+                for (const llvm::Value* returned : it->second)
+                    collectFunctionRefs(returned, depth + 1, flow, seen, out);
+        }
+        if (isMemcpyLike(CI) && CI->arg_size() >= 2)
+            collectFunctionRefs(CI->getArgOperand(1), depth + 1, flow, seen,
+                                out);
+        return;
+    }
+    if (const auto* IV = llvm::dyn_cast<llvm::InsertValueInst>(I)) {
+        collectFunctionRefs(IV->getAggregateOperand(), depth + 1, flow, seen,
+                            out);
+        collectFunctionRefs(IV->getInsertedValueOperand(), depth + 1, flow,
+                            seen, out);
+        return;
+    }
+    if (const auto* EV = llvm::dyn_cast<llvm::ExtractValueInst>(I)) {
+        collectFunctionRefs(EV->getAggregateOperand(), depth + 1, flow, seen,
+                            out);
+        return;
+    }
+    if (llvm::isa<llvm::GEPOperator>(I) ||
+        llvm::isa<llvm::AllocaInst>(I)) {
+        collectStoredRefs(I, depth, flow, seen, out);
+        if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(I))
+            collectFunctionRefs(gep->getPointerOperand(), depth + 1, flow,
+                                seen, out);
+        return;
+    }
+    if (llvm::isa<llvm::CastInst>(I) || llvm::isa<llvm::FreezeInst>(I) ||
+        I->getNumOperands() == 1)
+        collectFunctionRefs(I->getOperand(0), depth + 1, flow, seen, out);
+}
+
+//===----------------------------------------------------------------------===//
 // Constant dispatch tables + LLVM metadata globals.
 //===----------------------------------------------------------------------===//
 
 class DispatchTableScanner {
 public:
-    explicit DispatchTableScanner(const llvm::Module& M)
-        : M_(M), DL_(M.getDataLayout()) {}
+    DispatchTableScanner(const llvm::Module& M, const Options& opt)
+        : M_(M), DL_(M.getDataLayout()), allLabels_(opt.allLabels),
+          maxDepth_(opt.allLabels ? 14u : 8u) {}
 
     HandlerMap run() {
         scanModule();
@@ -472,9 +944,13 @@ private:
             if (!GV.hasInitializer())
                 continue;
             const llvm::StringRef name = GV.getName();
-            if (name == "llvm.global_ctors" || name == "llvm.global_dtors")
+            if (name == "llvm.global_ctors")
                 collectInitializers(GV.getInitializer());
-            else if (name == "llvm.global.annotations")
+            else if (name == "llvm.global_dtors") {
+                collectInitializers(GV.getInitializer());
+                // Destructor hooks are framework-triggered entries too.
+                collectRetained(GV.getInitializer(), name.str());
+            } else if (name == "llvm.global.annotations")
                 collectAnnotations(GV.getInitializer());
             else if (name == "llvm.used" || name == "llvm.compiler.used")
                 collectRetained(GV.getInitializer(), name.str());
@@ -533,11 +1009,13 @@ private:
             }
         for (const auto& item : best)
             addHandler(handlers_, item.first, HandlerKind::RouteTable,
-                       joinLabels(item.second->labels));
+                       joinLabels(item.second->labels, allLabels_));
     }
 
     const llvm::Module& M_;
     const llvm::DataLayout& DL_;
+    bool allLabels_;
+    unsigned maxDepth_;
     HandlerMap handlers_;
     std::unordered_set<const llvm::Function*> initializers_;
 
@@ -546,7 +1024,7 @@ private:
     Result visit(const llvm::Constant* C, bool labelsAllowed, unsigned depth,
                  std::unordered_set<const llvm::Constant*>& visiting) {
         Result result;
-        if (!C || depth > 8)
+        if (!C || depth > maxDepth_)
             return result;
         if (const auto* F = llvm::dyn_cast<llvm::Function>(C)) {
             result.functions.push_back(F);
@@ -678,12 +1156,12 @@ std::string readableName(llvm::StringRef mangled) {
 
 class RegistrationScanner {
 public:
-    explicit RegistrationScanner(
-        const llvm::Module& M,
+    RegistrationScanner(
+        const llvm::Module& M, const Options& opt,
         const std::unordered_set<const llvm::Function*>& initializers,
-        bool includeLibrary)
-        : M_(M), DL_(M.getDataLayout()), initializers_(initializers),
-          includeLibrary_(includeLibrary) {}
+        const ValueFlow& flow)
+        : M_(M), DL_(M.getDataLayout()), opt_(opt),
+          initializers_(initializers), flow_(flow) {}
 
     HandlerMap run() {
         for (const llvm::Function& F : M_) {
@@ -694,15 +1172,26 @@ public:
             for (const llvm::Instruction& I : llvm::instructions(F)) {
                 if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
                     const llvm::Function* callee = CB->getCalledFunction();
-                    if (callee && callee->isIntrinsic())
+                    if (callee && callee->isIntrinsic() && !isMemcpyLike(CB))
                         continue;
                     const std::string context = describeCall(CB, inCtor);
                     for (unsigned a = 0; a < CB->arg_size(); ++a)
                         record(CB->getArgOperand(a), context);
-                } else if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+                } else if (const auto* SI =
+                               llvm::dyn_cast<llvm::StoreInst>(&I)) {
                     if (pointsToLocalAlloca(SI->getPointerOperand()))
                         continue;  // a local fn-ptr variable is not a registry
                     record(SI->getValueOperand(), describeStore(SI, inCtor));
+                } else if (const auto* RMW =
+                               llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
+                    record(RMW->getValOperand(), prefix(inCtor) + "atomic");
+                } else if (const auto* CX =
+                               llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+                    record(CX->getNewValOperand(), prefix(inCtor) + "atomic");
+                } else if (const auto* IV =
+                               llvm::dyn_cast<llvm::InsertValueInst>(&I)) {
+                    record(IV->getInsertedValueOperand(),
+                           prefix(inCtor) + "aggregate");
                 }
             }
         }
@@ -712,17 +1201,19 @@ public:
 private:
     const llvm::Module& M_;
     const llvm::DataLayout& DL_;
+    const Options& opt_;
     const std::unordered_set<const llvm::Function*>& initializers_;
-    bool includeLibrary_;
+    const ValueFlow& flow_;
     HandlerMap handlers_;
 
     void record(const llvm::Value* V, const std::string& context) {
         std::vector<const llvm::Function*> funcs;
-        collectFunctionRefs(V, 0, funcs);
+        std::unordered_set<const llvm::Value*> seen;
+        collectFunctionRefs(V, 0, flow_, seen, funcs);
         for (const llvm::Function* F : funcs) {
             if (F->isDeclaration() || F->isIntrinsic())
                 continue;
-            if (!includeLibrary_) {
+            if (!opt_.includeLibrary) {
                 const std::string raw = F->getName().str();
                 if (looksLikeRuntimeSymbol(raw, llvm::demangle(raw)))
                     continue;
@@ -745,10 +1236,11 @@ private:
             if (const auto* C =
                     llvm::dyn_cast<llvm::Constant>(CB->getArgOperand(a))) {
                 const std::string label = extractLabel(C, DL_);
-                if (!label.empty() && label[0] != '#')
+                if (!label.empty() &&
+                    (opt_.allLabels || label[0] != '#'))
                     labels.push_back(label);
             }
-        const std::string joined = joinLabels(labels);
+        const std::string joined = joinLabels(labels, opt_.allLabels);
         if (!joined.empty())
             context += "(" + joined + ")";
         return context;
@@ -759,24 +1251,218 @@ private:
         const llvm::Value* ptr = SI->getPointerOperand()->stripPointerCasts();
         if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(ptr))
             context += " @" + GV->getName().str();
-        if (const llvm::BasicBlock* bb = SI->getParent()) {
-            std::string label;
-            for (const llvm::Instruction& prev : *bb) {
-                if (&prev == SI)
+        const llvm::Function* fn = SI->getFunction();
+        if (!fn)
+            return context;
+        std::string label;
+        const auto inspect = [&](const llvm::Instruction& prev) {
+            if (&prev == SI)
+                return true;
+            for (const llvm::Use& U : prev.operands())
+                if (const auto* C =
+                        llvm::dyn_cast<llvm::Constant>(U.get())) {
+                    const std::string candidate = extractLabel(C, DL_);
+                    if (!candidate.empty() &&
+                        (opt_.allLabels || candidate[0] != '#'))
+                        label = candidate;
+                }
+            return false;
+        };
+        if (opt_.allLabels) {
+            for (const llvm::Instruction& prev : llvm::instructions(*fn))
+                if (inspect(prev))
                     break;
-                for (const llvm::Use& U : prev.operands())
-                    if (const auto* C =
-                            llvm::dyn_cast<llvm::Constant>(U.get())) {
-                        const std::string candidate = extractLabel(C, DL_);
-                        if (!candidate.empty() && candidate[0] != '#')
-                            label = candidate;
-                    }
-            }
-            if (!label.empty())
-                context += "(" + sanitize(label) + ")";
+        } else if (const llvm::BasicBlock* bb = SI->getParent()) {
+            for (const llvm::Instruction& prev : *bb)
+                if (inspect(prev))
+                    break;
         }
+        if (!label.empty())
+            context += "(" + sanitize(label) + ")";
         return context;
     }
+};
+
+//===----------------------------------------------------------------------===//
+// Type-erased callables and module-level metadata.
+//===----------------------------------------------------------------------===//
+
+/// Recover lambda / std::function / std::bind targets: their body never
+/// appears as a function pointer, but the standard library's invoker thunk
+/// calls it directly. Only invokers whose address is actually installed in a
+/// callable object are considered, and terminals that user code already calls
+/// directly are ignored.
+class CallableScanner {
+public:
+    explicit CallableScanner(const llvm::Module& M) : M_(M) {}
+
+    HandlerMap run() {
+        std::unordered_set<const llvm::Function*> userCalled;
+        for (const llvm::Function& F : M_) {
+            if (F.isDeclaration() || F.isIntrinsic())
+                continue;
+            const std::string caller = F.getName().str();
+            if (looksLikeRuntimeSymbol(caller, llvm::demangle(caller)))
+                continue;
+            for (const llvm::Instruction& I : llvm::instructions(F))
+                if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I))
+                    if (const auto* callee = llvm::dyn_cast<llvm::Function>(
+                            CB->getCalledOperand()->stripPointerCasts()))
+                        userCalled.insert(callee);
+        }
+
+        for (const llvm::Function& F : M_) {
+            if (F.isDeclaration() || F.isIntrinsic())
+                continue;
+            const std::string raw = F.getName().str();
+            if (!isInvoker(raw) || !hasAddressTakenUse(F))
+                continue;
+            std::unordered_set<const llvm::Function*> visited;
+            std::vector<const llvm::Function*> terminals;
+            walk(&F, 0, visited, terminals);
+            for (const llvm::Function* target : terminals) {
+                if (target->isDeclaration() || target->isIntrinsic() ||
+                    userCalled.count(target))
+                    continue;
+                const std::string name = target->getName().str();
+                if (looksLikeRuntimeSymbol(name, llvm::demangle(name)))
+                    continue;
+                addHandler(handlers_, target, HandlerKind::Registration,
+                           "type-erased callable");
+            }
+        }
+        return handlers_;
+    }
+
+private:
+    static bool isInvoker(const std::string& raw) {
+        static const char* kParts[] = {"_M_invoke", "_ZNKSt5_Bind",
+                                      "_ZNKSt8_Mem_fn", "__invoke_impl",
+                                      "__invoke_r"};
+        for (const char* part : kParts)
+            if (raw.find(part) != std::string::npos)
+                return true;
+        return false;
+    }
+
+    static bool hasAddressTakenUse(const llvm::Function& F) {
+        for (const llvm::Use& U : F.uses()) {
+            const auto* CB = llvm::dyn_cast<llvm::CallBase>(U.getUser());
+            if (CB && CB->isCallee(&U))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    void walk(const llvm::Function* F, unsigned depth,
+              std::unordered_set<const llvm::Function*>& visited,
+              std::vector<const llvm::Function*>& terminals) {
+        if (!F || depth > 6 || !visited.insert(F).second)
+            return;
+        for (const llvm::Instruction& I : llvm::instructions(*F)) {
+            const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+                continue;
+            const auto* callee = llvm::dyn_cast_or_null<llvm::Function>(
+                CB->getCalledOperand()->stripPointerCasts());
+            if (!callee || callee->isDeclaration() || callee->isIntrinsic())
+                continue;
+            const std::string name = callee->getName().str();
+            if (looksLikeRuntimeSymbol(name, llvm::demangle(name)))
+                walk(callee, depth + 1, visited, terminals);
+            else
+                terminals.push_back(callee);
+        }
+    }
+
+    const llvm::Module& M_;
+    HandlerMap handlers_;
+};
+
+/// Custom sections, aliases / ifuncs, function metadata and (opt-in) vtables.
+class MetadataScanner {
+public:
+    MetadataScanner(const llvm::Module& M, const Options& opt)
+        : M_(M), opt_(opt) {}
+
+    HandlerMap run() {
+        if (opt_.sectionHandlers)
+            scanSections();
+        scanAliases();
+        scanAnnotations();
+        if (opt_.virtualHandlers)
+            scanVirtualTables();
+        return handlers_;
+    }
+
+private:
+    void mark(const llvm::Constant* init, HandlerKind kind,
+              const std::string& trigger) {
+        std::vector<const llvm::Function*> funcs;
+        std::unordered_set<const llvm::Constant*> visiting;
+        collectConstantFunctions(init, 0, visiting, funcs);
+        for (const llvm::Function* F : funcs)
+            if (!F->isDeclaration() && !F->isIntrinsic())
+                addHandler(handlers_, F, kind, trigger);
+    }
+
+    void scanSections() {
+        for (const llvm::GlobalVariable& GV : M_.globals()) {
+            const llvm::StringRef section = GV.getSection();
+            const llvm::StringRef name = GV.getName();
+            if (section.empty() || !GV.hasInitializer() ||
+                name.starts_with("llvm.") || isRuntimeMetadataGlobal(name))
+                continue;
+            mark(GV.getInitializer(), HandlerKind::Section,
+                 "section:" + sanitize(section.str()));
+        }
+    }
+
+    void scanAliases() {
+        for (const llvm::GlobalAlias& A : M_.aliases()) {
+            if (!isExternallyVisible(A))
+                continue;
+            if (const llvm::Function* F =
+                    resolveAliaseeFunction(A.getAliasee()))
+                if (!F->isDeclaration() && !F->isIntrinsic())
+                    addHandler(handlers_, F, HandlerKind::Alias,
+                               "alias:" + A.getName().str());
+        }
+        for (const llvm::GlobalIFunc& IF : M_.ifuncs()) {
+            if (!isExternallyVisible(IF))
+                continue;
+            if (const llvm::Function* F =
+                    resolveAliaseeFunction(IF.getResolver()))
+                addHandler(handlers_, F, HandlerKind::Alias,
+                           "ifunc:" + IF.getName().str());
+        }
+    }
+
+    void scanAnnotations() {
+        for (const llvm::Function& F : M_) {
+            if (F.isDeclaration() || F.isIntrinsic())
+                continue;
+            if (const llvm::MDNode* node = F.getMetadata("annotation")) {
+                std::string text = metadataText(node);
+                addHandler(handlers_, &F, HandlerKind::Annotation,
+                           text.empty() ? "annotation" : text);
+            }
+        }
+    }
+
+    void scanVirtualTables() {
+        for (const llvm::GlobalVariable& GV : M_.globals()) {
+            if (!GV.hasInitializer() || !GV.getName().starts_with("_ZTV"))
+                continue;
+            mark(GV.getInitializer(), HandlerKind::Virtual,
+                 "vtable:" + readableName(GV.getName()));
+        }
+    }
+
+    const llvm::Module& M_;
+    const Options& opt_;
+    HandlerMap handlers_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -892,21 +1578,58 @@ std::vector<int> computeSccs(const std::vector<std::vector<int>>& edges,
     return comp;
 }
 
+/// Nodes reachable from a real program entry (main / framework entry / a
+/// global constructor). A direct call inside dead code must not prevent a
+/// genuine external entry from being reported.
+std::vector<char>
+computeReachable(const ModuleGraph& g, const Options& opt,
+                 const std::unordered_set<const llvm::Function*>& initializers) {
+    std::vector<char> reachable(g.functions.size(), 0);
+    std::vector<size_t> work;
+    for (size_t i = 0; i < g.functions.size(); ++i) {
+        const llvm::Function* F = g.functions[i];
+        // A function whose address escapes may be invoked indirectly from
+        // anywhere, so it is a potential caller too. Only genuinely dead code
+        // (no address taken, unreachable from a program entry) is ignored.
+        if (isFrameworkEntryName(F->getName(), opt.extraEntryNames) ||
+            initializers.count(F) || g.addressTaken[i]) {
+            reachable[i] = 1;
+            work.push_back(i);
+        }
+    }
+    while (!work.empty()) {
+        const size_t u = work.back();
+        work.pop_back();
+        for (const int v : g.callees[u])
+            if (!reachable[v]) {
+                reachable[v] = 1;
+                work.push_back(static_cast<size_t>(v));
+            }
+    }
+    return reachable;
+}
+
 //===----------------------------------------------------------------------===//
 // Entry selection.
 //===----------------------------------------------------------------------===//
 
 struct Entry {
-    std::string name;
+    std::string name;       ///< printed name (mangled or demangled)
+    std::string mangled;
+    std::string demangled;
     const char* reason;
-    std::string detail;
+    std::string detail;     ///< trigger
+    std::string file;
+    unsigned start = 0;
+    unsigned end = 0;
+    std::string signature;
 };
 
 int reasonRank(const char* reason) {
     static const char* kOrder[] = {
         "program-entry", "route-handler", "registered-handler", "annotated",
-        "retained",      "callback",      "no-caller",          "exported",
-        "defined"};
+        "retained",      "section-handler", "aliased", "virtual-handler",
+        "callback",      "no-caller",      "exported", "defined"};
     for (int i = 0; i < static_cast<int>(std::size(kOrder)); ++i)
         if (std::strcmp(reason, kOrder[i]) == 0)
             return i;
@@ -915,45 +1638,57 @@ int reasonRank(const char* reason) {
 
 std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
     const ModuleGraph g = buildGraph(M);
+    const ValueFlow flow = buildValueFlow(M);
+    FunctionFilter filter =
+        FunctionFilter::build(M, opt.namePatterns, opt.appSourceRoots);
+    const bool hasDebugInfo = M.getNamedMetadata("llvm.dbg.cu") != nullptr;
 
-    DispatchTableScanner tables(M);
+    DispatchTableScanner tables(M, opt);
     HandlerMap handlers = tables.run();
     mergeHandlers(handlers,
-                  RegistrationScanner(M, tables.initializers(),
-                                      opt.includeLibrary).run());
-    // Library/framework internals that happen to sit in a vtable or get passed
-    // to a registration API are not application entries.
-    if (!opt.includeLibrary)
-        for (auto it = handlers.begin(); it != handlers.end();) {
-            const std::string raw = it->first->getName().str();
-            if (looksLikeRuntimeSymbol(raw, llvm::demangle(raw)))
-                it = handlers.erase(it);
-            else
-                ++it;
-        }
+                  RegistrationScanner(M, opt, tables.initializers(),
+                                      flow).run());
+    if (opt.typeErased)
+        mergeHandlers(handlers, CallableScanner(M).run());
+    mergeHandlers(handlers, MetadataScanner(M, opt).run());
 
-    // An SCC is a root group when no direct call from outside that SCC reaches
-    // it. An escaping address no longer disqualifies it: indirect dispatch is
+    // Library/framework internals are not application entries. Definition-site
+    // classification is only trusted when the caller supplied source roots;
+    // otherwise a callback in an include/ tree or a TU built without -g would
+    // be dropped just because it has no DISubprogram or lives in a header.
+    for (auto it = handlers.begin(); it != handlers.end();) {
+        const std::string raw = it->first->getName().str();
+        const std::string demangled = llvm::demangle(raw);
+        if ((!opt.includeLibrary &&
+             looksLikeRuntimeSymbol(raw, demangled)) ||
+            filter.isFiltered(raw, demangled))
+            it = handlers.erase(it);
+        else
+            ++it;
+    }
+    const std::unordered_set<const llvm::Function*> aliasTargets =
+        collectAliasTargets(M);
+
+    // An SCC is a root group when no *reachable* direct call from outside it
+    // reaches it. An escaping address still qualifies: indirect dispatch is
     // exactly how HTTP handlers and other framework callbacks are invoked.
     int sccCount = 0;
     std::vector<int> comp;
     std::vector<char> hasExternalCaller;
+    std::vector<char> reachable;
     if (opt.mode == Mode::Roots) {
         comp = computeSccs(g.callees, sccCount);
         hasExternalCaller.assign(sccCount, 0);
-        for (size_t u = 0; u < g.callees.size(); ++u)
+        if (opt.reachableRoots)
+            reachable = computeReachable(g, opt, tables.initializers());
+        for (size_t u = 0; u < g.callees.size(); ++u) {
+            if (!reachable.empty() && !reachable[u])
+                continue;
             for (int v : g.callees[u])
                 if (comp[u] != comp[v])
                     hasExternalCaller[comp[v]] = 1;
+        }
     }
-
-    // Debug info is an enhancement, not a prerequisite: callbacks are kept by
-    // default when their symbol is not plainly library/runtime code. With -g,
-    // FunctionFilter additionally removes out-of-tree framework templates.
-    std::unique_ptr<FunctionFilter> filter;
-    if (opt.mode == Mode::Roots && !opt.includeLibrary)
-        filter = std::make_unique<FunctionFilter>(FunctionFilter::build(M));
-    const bool hasDebugInfo = M.getNamedMetadata("llvm.dbg.cu") != nullptr;
 
     std::vector<Entry> entries;
     for (size_t i = 0; i < g.functions.size(); ++i) {
@@ -965,20 +1700,28 @@ std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
         const auto hit = handlers.find(F);
         switch (opt.mode) {
         case Mode::Roots:
-            if (raw == "main" || raw == "svf.main") {
+            if (isFrameworkEntryName(raw, opt.extraEntryNames)) {
                 reason = "program-entry";
+                if (raw != "main" && raw != "svf.main")
+                    detail = "entry-name";
             } else if (hit != handlers.end()) {
                 reason = kindReason(hit->second.kind);
                 detail = hit->second.trigger;
             } else if (!hasExternalCaller[comp[i]]) {
-                if (!opt.includeLibrary && isCompilerInitStub(raw))
-                    continue;
-                if (g.addressTaken[i] && !opt.includeLibrary) {
-                    const bool appByDebug =
-                        hasDebugInfo && filter && filter->isAppFunction(raw);
+                if (!opt.includeLibrary) {
+                    if (isCompilerInitStub(raw) ||
+                        tables.initializers().count(F))
+                        continue;
+                    const bool hasDebugForSymbol =
+                        filter.findLineRange(raw) != nullptr;
+                    const bool appByDebug = hasDebugInfo &&
+                                           hasDebugForSymbol &&
+                                           filter.isAppFunction(raw);
                     const bool excludedByDebug =
-                        hasDebugInfo && filter &&
-                        filter->isExcluded(raw, demangled);
+                        !opt.appSourceRoots.empty() && hasDebugInfo &&
+                        hasDebugForSymbol && filter.isExcluded(raw, demangled);
+                    if (filter.isFiltered(raw, demangled))
+                        continue;
                     if (!appByDebug &&
                         (looksLikeRuntimeSymbol(raw, demangled) ||
                          excludedByDebug))
@@ -994,7 +1737,7 @@ std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
             }
             break;
         case Mode::Exported:
-            if (!F->hasLocalLinkage())
+            if (isExternallyVisible(*F) || aliasTargets.count(F))
                 reason = "exported";
             break;
         case Mode::All:
@@ -1003,8 +1746,21 @@ std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
         }
         if (!reason)
             continue;
-        entries.push_back({opt.demangle ? demangled : raw, reason,
-                           std::move(detail)});
+        Entry entry;
+        entry.name = opt.format == OutputFormat::Json
+                         ? raw
+                         : (opt.demangle ? demangled : raw);
+        entry.mangled = raw;
+        entry.demangled = demangled;
+        entry.reason = reason;
+        entry.detail = std::move(detail);
+        entry.signature = functionSignature(*F);
+        if (const FuncLineRange* range = filter.findLineRange(raw)) {
+            entry.file = range->file;
+            entry.start = range->start;
+            entry.end = range->end;
+        }
+        entries.push_back(std::move(entry));
     }
     std::sort(entries.begin(), entries.end(),
               [](const Entry& a, const Entry& b) {
@@ -1013,8 +1769,10 @@ std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
                   return reasonRank(a.reason) < reasonRank(b.reason);
               });
     // Demangling can collapse distinct symbols (e.g. the D0/D1 destructor
-    // variants) into the same name; a name list only needs one of each. Keep
-    // the most specific reason and merge all triggers.
+    // variants) into the same name; a plain name list only needs one of each.
+    // JSON keeps every symbol so downstream callers can disambiguate.
+    if (opt.format == OutputFormat::Json)
+        return entries;
     std::vector<Entry> merged;
     merged.reserve(entries.size());
     for (Entry& e : entries) {
@@ -1034,21 +1792,146 @@ std::vector<Entry> collectEntries(const llvm::Module& M, const Options& opt) {
     return merged;
 }
 
+bool readPatternFile(const std::string& path,
+                     std::vector<std::string>& patterns) {
+    std::ifstream in(path);
+    if (!in) {
+        llvm::errs() << "[ERROR] cannot open filter file: " << path << "\n";
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const size_t begin = line.find_first_not_of(" \t");
+        if (begin == std::string::npos)
+            continue;
+        const size_t end = line.find_last_not_of(" \t");
+        line = line.substr(begin, end - begin + 1);
+        if (line.empty() || line[0] == '#')
+            continue;
+        patterns.push_back(std::move(line));
+    }
+    return true;
+}
+
+/// Load every input module and link them in memory. Cross-TU dispatch tables
+/// and registration sites must be visible in one module; previously only the
+/// last positional argument was analysed, silently.
+std::unique_ptr<llvm::Module>
+loadModules(const std::vector<std::string>& files,
+            llvm::LLVMContext& context) {
+    std::unique_ptr<llvm::Module> merged;
+    for (const std::string& file : files) {
+        llvm::SMDiagnostic diagnostic;
+        std::unique_ptr<llvm::Module> part =
+            llvm::parseIRFile(file, diagnostic, context);
+        if (!part) {
+            llvm::errs() << "[ERROR] failed to load bitcode file: " << file
+                         << "\n";
+            diagnostic.print("entry_extractor", llvm::errs());
+            return nullptr;
+        }
+        if (!merged) {
+            merged = std::move(part);
+            continue;
+        }
+        if (llvm::Linker::linkModules(*merged, std::move(part))) {
+            llvm::errs() << "[ERROR] failed to link bitcode file: " << file
+                         << "\n";
+            return nullptr;
+        }
+    }
+    return merged;
+}
+
+/// Heuristics that tell the caller when the IR is no longer a faithful picture
+/// of the source (optimisation, missing/mixed debug info, multiple modules).
+std::vector<std::string> diagnoseModule(const llvm::Module& M,
+                                        const Options& opt) {
+    std::vector<std::string> warnings;
+    size_t defined = 0, withDebug = 0, optNone = 0;
+    for (const llvm::Function& F : M) {
+        if (F.isDeclaration() || F.isIntrinsic())
+            continue;
+        ++defined;
+        if (F.getSubprogram())
+            ++withDebug;
+        if (F.hasOptNone())
+            ++optNone;
+    }
+    const bool hasCompileUnit = M.getNamedMetadata("llvm.dbg.cu") != nullptr;
+    if (!hasCompileUnit)
+        warnings.push_back("bitcode has no debug info; source locations are "
+                           "unavailable and registration tables may have been "
+                           "folded by optimisation");
+    else if (withDebug && withDebug < defined)
+        warnings.push_back("mixed debug info: some functions have no "
+                           "DISubprogram; pass --app-source-root for reliable "
+                           "library classification");
+    // clang -O0 emits the optnone attribute on every function; its absence in
+    // a module that does carry debug info is a reliable optimisation signal.
+    if (hasCompileUnit && defined > 3 && optNone == 0)
+        warnings.push_back("bitcode appears optimised (-O2/LTO): constant "
+                           "route tables and registration calls may have been "
+                           "folded; prefer -O0 or pre-LTO bitcode");
+    if (opt.bcFiles.size() > 1)
+        warnings.push_back("linked " +
+                           std::to_string(opt.bcFiles.size()) +
+                           " bitcode modules in memory");
+    return warnings;
+}
+
+void writeJson(std::ostream& out, const llvm::Module& M, const Options& opt,
+               const std::vector<Entry>& entries,
+               const std::vector<std::string>& warnings) {
+    out << "{\n  \"module\": " << jsonEscape(M.getModuleIdentifier())
+        << ",\n  \"mode\": " << jsonEscape(modeName(opt.mode))
+        << ",\n  \"warnings\": [";
+    for (size_t i = 0; i < warnings.size(); ++i) {
+        if (i)
+            out << ", ";
+        out << jsonEscape(warnings[i]);
+    }
+    out << "],\n  \"entries\": [\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const Entry& e = entries[i];
+        out << "    {\"name\": " << jsonEscape(e.name)
+            << ", \"mangled\": " << jsonEscape(e.mangled)
+            << ", \"demangled\": " << jsonEscape(e.demangled)
+            << ", \"reason\": " << jsonEscape(e.reason)
+            << ", \"trigger\": " << jsonEscape(e.detail)
+            << ", \"signature\": " << jsonEscape(e.signature)
+            << ", \"file\": " << jsonEscape(e.file)
+            << ", \"line\": " << e.start
+            << ", \"end_line\": " << e.end << "}";
+        if (i + 1 < entries.size())
+            out << ",";
+        out << "\n";
+    }
+    out << "  ]\n}\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     Options opt;
+    auto needValue = [&](int& i, const char* flag) -> const char* {
+        if (i + 1 >= argc) {
+            llvm::errs() << "[ERROR] " << flag << " needs a value\n";
+            return nullptr;
+        }
+        return argv[++i];
+    };
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
         if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
             printUsage(argv[0]);
             return 0;
         } else if (std::strcmp(arg, "--mode") == 0) {
-            if (i + 1 >= argc) {
-                llvm::errs() << "[ERROR] --mode needs a value\n";
+            const char* value = needValue(i, "--mode");
+            if (!value)
                 return 1;
-            }
-            const char* value = argv[++i];
             if (std::strcmp(value, "roots") == 0)
                 opt.mode = Mode::Roots;
             else if (std::strcmp(value, "routes") == 0)
@@ -1062,41 +1945,80 @@ int main(int argc, char** argv) {
                              << "' (expected roots, routes, exported or all)\n";
                 return 1;
             }
+        } else if (std::strcmp(arg, "--format") == 0) {
+            const char* value = needValue(i, "--format");
+            if (!value)
+                return 1;
+            if (std::strcmp(value, "names") == 0)
+                opt.format = OutputFormat::Names;
+            else if (std::strcmp(value, "json") == 0)
+                opt.format = OutputFormat::Json;
+            else {
+                llvm::errs() << "[ERROR] unknown --format '" << value
+                             << "' (expected names or json)\n";
+                return 1;
+            }
         } else if (std::strcmp(arg, "--include-library") == 0) {
             opt.includeLibrary = true;
         } else if (std::strcmp(arg, "--demangle") == 0) {
             opt.demangle = true;
         } else if (std::strcmp(arg, "--verbose") == 0) {
             opt.verbose = true;
+        } else if (std::strcmp(arg, "--all-labels") == 0) {
+            opt.allLabels = true;
+        } else if (std::strcmp(arg, "--virtual-handlers") == 0) {
+            opt.virtualHandlers = true;
+        } else if (std::strcmp(arg, "--no-type-erased") == 0) {
+            opt.typeErased = false;
+        } else if (std::strcmp(arg, "--no-section-handlers") == 0) {
+            opt.sectionHandlers = false;
+        } else if (std::strcmp(arg, "--legacy-roots") == 0) {
+            opt.reachableRoots = false;
         } else if (std::strcmp(arg, "--output") == 0) {
-            if (i + 1 >= argc) {
-                llvm::errs() << "[ERROR] --output needs a file path\n";
+            const char* value = needValue(i, "--output");
+            if (!value)
                 return 1;
-            }
-            opt.outputFile = argv[++i];
+            opt.outputFile = value;
+        } else if (std::strcmp(arg, "--filter-file") == 0) {
+            const char* value = needValue(i, "--filter-file");
+            if (!value)
+                return 1;
+            opt.filterFile = value;
+        } else if (std::strcmp(arg, "--app-source-root") == 0) {
+            const char* value = needValue(i, "--app-source-root");
+            if (!value)
+                return 1;
+            opt.appSourceRoots.push_back(value);
+        } else if (std::strcmp(arg, "--entry-name") == 0) {
+            const char* value = needValue(i, "--entry-name");
+            if (!value)
+                return 1;
+            opt.extraEntryNames.push_back(value);
         } else if (arg[0] == '-') {
             llvm::errs() << "[ERROR] unknown option '" << arg << "'\n";
             return 1;
         } else {
-            opt.bcFile = arg;
+            opt.bcFiles.push_back(arg);
         }
     }
 
-    if (opt.bcFile.empty()) {
+    if (opt.bcFiles.empty()) {
         printUsage(argv[0]);
         return 1;
     }
-
-    llvm::SMDiagnostic diagnostic;
-    llvm::LLVMContext context;
-    std::unique_ptr<llvm::Module> module =
-        llvm::parseIRFile(opt.bcFile, diagnostic, context);
-    if (!module) {
-        llvm::errs() << "[ERROR] failed to load bitcode file: " << opt.bcFile
-                     << "\n";
-        diagnostic.print(argv[0], llvm::errs());
+    if (!opt.filterFile.empty() &&
+        !readPatternFile(opt.filterFile, opt.namePatterns))
         return 1;
-    }
+
+    llvm::LLVMContext context;
+    std::unique_ptr<llvm::Module> module = loadModules(opt.bcFiles, context);
+    if (!module)
+        return 1;
+
+    const std::vector<std::string> warnings = diagnoseModule(*module, opt);
+    if (opt.verbose)
+        for (const std::string& warning : warnings)
+            llvm::errs() << "[WARN] " << warning << "\n";
 
     const std::vector<Entry> entries = collectEntries(*module, opt);
 
@@ -1111,14 +2033,18 @@ int main(int argc, char** argv) {
         }
         out = &file;
     }
-    for (const Entry& entry : entries) {
-        *out << entry.name;
-        if (opt.verbose) {
-            *out << '\t' << entry.reason;
-            if (!entry.detail.empty())
-                *out << '\t' << entry.detail;
+    if (opt.format == OutputFormat::Json) {
+        writeJson(*out, *module, opt, entries, warnings);
+    } else {
+        for (const Entry& entry : entries) {
+            *out << entry.name;
+            if (opt.verbose) {
+                *out << '\t' << entry.reason;
+                if (!entry.detail.empty())
+                    *out << '\t' << entry.detail;
+            }
+            *out << '\n';
         }
-        *out << '\n';
     }
     if (out->fail()) {
         llvm::errs() << "[ERROR] failed to write output\n";
@@ -1130,7 +2056,7 @@ int main(int argc, char** argv) {
         for (const llvm::Function& F : *module)
             if (!F.isDeclaration() && !F.isIntrinsic())
                 ++defined;
-        llvm::errs() << "[INFO] " << opt.bcFile << ": " << defined
+        llvm::errs() << "[INFO] " << opt.bcFiles.front() << ": " << defined
                      << " defined functions, " << entries.size()
                      << " entries (mode=" << modeName(opt.mode) << ")\n";
     }

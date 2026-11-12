@@ -7,7 +7,7 @@
 // which backend was selected.
 //===----------------------------------------------------------------------===//
 
-#include "class_report.h"
+#include "class_extractor_report.h"
 
 #include <cctype>
 #include <cstdio>

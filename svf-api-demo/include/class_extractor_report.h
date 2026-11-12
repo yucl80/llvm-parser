@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// class_report.h — shared data model for class-information extraction.
+// class_extractor_report.h — shared data model for class-information extraction.
 //
 // Two backends fill the very same report:
 //   * class_extractor_bit_code.cpp : LLVM bitcode / IR (DWARF debug info)
@@ -10,8 +10,8 @@
 // writeClassReport(). Backends never parse CLI arguments or write reports.
 //===----------------------------------------------------------------------===//
 
-#ifndef CLASS_REPORT_H
-#define CLASS_REPORT_H
+#ifndef CLASS_EXTRACTOR_REPORT_H
+#define CLASS_EXTRACTOR_REPORT_H
 
 #include <cstdint>
 #include <string>
@@ -118,4 +118,4 @@ bool writeClassReport(const ClassReport& report, const ClassOptions& options,
 
 } // namespace classinfo
 
-#endif // CLASS_REPORT_H
+#endif // CLASS_EXTRACTOR_REPORT_H

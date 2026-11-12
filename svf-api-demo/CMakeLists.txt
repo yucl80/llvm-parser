@@ -151,6 +151,30 @@ set_target_properties(sql_extractor PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
 
 # ---------------------------------------------------------------------------
+# Class/method change detector: ./class_diff [options] <old> <new> [-- args]
+#
+# Parses two C/C++ projects (source trees with libclang, .bc/.ll with LLVM IR
+# + DWARF) and reports the classes that changed together with their added /
+# removed / modified member functions. The shared model, both backends and the
+# driver live in separate translation units.
+# ---------------------------------------------------------------------------
+add_executable(class_diff
+    src/class_diff.cpp           # CLI driver / main
+    src/class_diff_common.cpp    # shared model, discovery, diff + report writers
+    src/class_diff_source.cpp    # libclang AST backend
+    src/class_diff_bitcode.cpp   # LLVM IR + DWARF backend
+    include/class_diff.h)
+target_compile_options(class_diff PRIVATE -Wall -Wextra)
+target_include_directories(class_diff PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(class_diff SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")
+# libclang for the source backend, the monolithic libLLVM for the bitcode
+# backend (IRReader, DebugInfo, Demangle).
+target_link_libraries(class_diff PRIVATE
+    "${LLVM_LIB}" "${CLANG_LIB}" ${CMAKE_DL_LIBS})
+set_target_properties(class_diff PROPERTIES BUILD_RPATH "${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
 # Bitcode SQLite SQL-script extractor: ./sql_bitcode_extractor [options] <module>
 #
 # Parses LLVM bitcode/IR with the IR reader and recovers the SQL argument of

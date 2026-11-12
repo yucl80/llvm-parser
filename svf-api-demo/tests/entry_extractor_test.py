@@ -23,7 +23,12 @@ to register its request handlers:
   * release bitcode without -g keeps its callbacks;
   * the C++ fixture is also built and run natively, proving it is live code;
   * --verbose triggers, plain --entry-file-compatible output, CLI errors;
-  * the repository's synchronous and asynchronous HTTP service fixtures.
+  * the repository's synchronous and asynchronous HTTP service fixtures;
+  * extended labels (negative / 64-bit keys, UTF-8, wide strings, --all-labels);
+  * local value-flow registration (select, load/store, returned pointers,
+    memcpy), custom sections, opt-in vtable handlers and multi-module input;
+  * type-erased lambda handlers, reachability-based roots, exported visibility,
+    --filter-file / --entry-name, JSON reports and -O2 stability warnings.
 
 Run through CTest (see CMakeLists.txt) or directly:
     python3 tests/entry_extractor_test.py --extractor <build>/entry_extractor
@@ -132,6 +137,98 @@ define void @ctor_init() {
 define i32 @main() { ret i32 0 }
 """
 
+# Extended label decoding: negative / 64-bit opcode keys, UTF-8 and wide
+# strings, plus a table carrying both a string and an integer key.
+EXTENDED_LABELS = r"""
+@.str.ok = private constant [4 x i8] c"/ok\00", align 1
+@.str.utf8 = private constant [6 x i8] c"/u\E7\94\A8\00", align 1
+@.str.wide = private constant [2 x i16] [i16 47, i16 0], align 2
+
+@ok_table = internal constant { ptr, ptr } { ptr @.str.ok, ptr @h_ok }, align 8
+@neg_table = internal constant { i32, ptr } { i32 -1, ptr @h_neg }, align 8
+@big_table = internal constant { i64, ptr } { i64 4294967300, ptr @h_big }, align 8
+@utf_table = internal constant { ptr, ptr } { ptr @.str.utf8, ptr @h_utf }, align 8
+@wide_table = internal constant { ptr, ptr } { ptr @.str.wide, ptr @h_wide }, align 8
+@mixed_table = internal constant { ptr, i32, ptr }
+  { ptr @.str.ok, i32 7, ptr @h_mixed }, align 8
+
+define void @h_ok(i32 %x) { ret void }
+define void @h_neg(i32 %x) { ret void }
+define void @h_big(i32 %x) { ret void }
+define void @h_utf(i32 %x) { ret void }
+define void @h_wide(i32 %x) { ret void }
+define void @h_mixed(i32 %x) { ret void }
+define i32 @main() { ret i32 0 }
+"""
+
+# Registration through a local value flow: select, load/store, a function
+# returning a pointer, and a memcpy-style table copy.
+VALUE_FLOW = r"""
+@slot = internal global ptr null, align 8
+@tbl = internal constant [1 x ptr] [ptr @h_memcpy], align 8
+@dest = internal global [1 x ptr] zeroinitializer, align 8
+
+declare void @reg(ptr)
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)
+
+define void @h_load(i32 %x) { ret void }
+define void @h_select(i32 %x) { ret void }
+define void @h_direct(i32 %x) { ret void }
+define void @h_return(i32 %x) { ret void }
+define void @h_memcpy(i32 %x) { ret void }
+
+define ptr @choose() {
+  ret ptr @h_return
+}
+
+define void @install() {
+  %c = icmp eq i32 1, 1
+  %sel = select i1 %c, ptr @h_select, ptr @h_direct
+  call void @reg(ptr %sel)
+  store ptr @h_load, ptr @slot, align 8
+  %p = load ptr, ptr @slot, align 8
+  call void @reg(ptr %p)
+  %r = call ptr @choose()
+  call void @reg(ptr %r)
+  call void @llvm.memcpy.p0.p0.i64(ptr @dest, ptr @tbl, i64 8, i1 false)
+  %q = load ptr, ptr @dest, align 8
+  call void @reg(ptr %q)
+  ret void
+}
+
+define i32 @main() {
+  call void @install()
+  ret i32 0
+}
+"""
+
+# A linker-set style table in a custom section, and an Itanium vtable.
+SECTION_TABLE = r"""
+@p_init = internal constant ptr @section_init, section ".init_array", align 8
+
+define void @section_init() { ret void }
+define i32 @main() {
+  call void @section_init()
+  ret i32 0
+}
+"""
+
+VIRTUAL_TABLE = r"""
+@_ZTV7Handler = internal constant [1 x ptr] [ptr @v_handler], align 8
+
+define void @v_handler() { ret void }
+define i32 @main() { ret i32 0 }
+"""
+
+MULTI_MODULE_A = r"""
+define void @alpha_handler(i32 %x) { ret void }
+define i32 @main() { ret i32 0 }
+"""
+
+MULTI_MODULE_B = r"""
+define void @beta_handler(i32 %x) { ret void }
+"""
+
 # The C++ fixtures live in their own source files next to this driver:
 #   entry_extractor_fixture.cpp      — a working network-service model carrying
 #                                      EXPECT_ENTRY / EXPECT_ABSENT declarations
@@ -157,7 +254,13 @@ class Suite:
         self.cpp = {}
 
         for name, source in (("routes", ROUTE_TABLES), ("metadata", METADATA),
-                             ("ctors", CTORS)):
+                             ("ctors", CTORS),
+                             ("extended_labels", EXTENDED_LABELS),
+                             ("value_flow", VALUE_FLOW),
+                             ("section", SECTION_TABLE),
+                             ("virtual", VIRTUAL_TABLE),
+                             ("multi_a", MULTI_MODULE_A),
+                             ("multi_b", MULTI_MODULE_B)):
             self.bc[name] = self.assemble(name, source)
 
         self.cpp_fixture = Path(args.source_dir) / "entry_extractor_fixture.cpp"
@@ -175,6 +278,12 @@ class Suite:
         main_tu = self.compile_cpp(self.cpp_fixture, "fixture_main_tu", True)
         aux_tu = self.compile_cpp(self.cpp_aux, "fixture_aux_tu", True)
         self.cpp["cross_tu"] = self.link([main_tu, aux_tu], "fixture_linked")
+
+        advanced = Path(args.source_dir) / "entry_extractor_advanced_fixture.cpp"
+        self.expect(advanced.is_file(), "advanced C++ fixture missing")
+        self.cpp["advanced"] = self.compile_cpp(advanced, "advanced", True)
+        self.cpp["advanced_opt"] = self.compile_cpp(
+            advanced, "advanced_opt", True, extra=["-O2"])
 
     # -- expectation declarations in the C++ fixture -----------------------
 
@@ -523,6 +632,137 @@ class Suite:
                     "compiler ctor stubs should not be reported as callbacks")
         self.expect(len(roots) < 12,
                     "async roots list is noisy (%d entries)" % len(roots))
+
+    # -- extended coverage --------------------------------------------------
+
+    def test_extended_label_decoding(self):
+        rows = self.rows(self.bc["extended_labels"])
+        expected = {
+            "h_ok": "/ok",
+            "h_neg": "#-1",
+            "h_big": "#4294967300",
+            "h_utf": "/u用",
+            "h_wide": "/",
+        }
+        for name, label in expected.items():
+            row = self.find(rows, name)
+            self.expect(row is not None and row[1] == "route-handler",
+                        "%s should be a route-handler" % name)
+            self.expect(label in self.trigger(rows, name),
+                        "%s trigger %r lacks %r" %
+                        (name, self.trigger(rows, name), label))
+        proc = self.run(["--mode", "routes", "--verbose", "--all-labels",
+                         str(self.bc["extended_labels"])])
+        mixed = [line for line in proc.stdout.splitlines()
+                 if "h_mixed" in line]
+        self.expect(bool(mixed) and "#7" in mixed[0],
+                    "--all-labels should keep integer keys beside strings")
+
+    def test_value_flow_registration(self):
+        rows = self.rows(self.bc["value_flow"])
+        for name in ("h_select", "h_direct", "h_load", "h_return",
+                     "h_memcpy"):
+            row = self.find(rows, name)
+            self.expect(row is not None and row[1] == "registered-handler",
+                        "%s missing from value-flow registration" % name)
+
+    def test_section_and_virtual_handlers(self):
+        row = self.find(self.rows(self.bc["section"]), "section_init")
+        self.expect(row is not None and row[1] == "section-handler",
+                    "custom-section handler missing")
+        self.expect(self.find(self.rows(self.bc["virtual"]), "v_handler") is None,
+                    "vtable handler must be opt-in")
+        enabled = self.run(["--mode", "routes", "--verbose",
+                            "--virtual-handlers", str(self.bc["virtual"])])
+        self.expect("v_handler" in enabled.stdout and
+                    "virtual-handler" in enabled.stdout,
+                    "--virtual-handlers should report the vtable function")
+
+    def test_multiple_modules(self):
+        both = self.run(["--mode", "roots", str(self.bc["multi_a"]),
+                         str(self.bc["multi_b"])])
+        names = both.stdout.splitlines()
+        self.expect("alpha_handler" in names and "beta_handler" in names,
+                    "multiple bitcode modules must be linked in memory")
+        single = self.run(["--mode", "roots", str(self.bc["multi_a"])])
+        self.expect("beta_handler" not in single.stdout.splitlines(),
+                    "a single module must not contain the other TU's handler")
+
+    def test_json_report(self):
+        import json
+        proc = self.run(["--mode", "routes", "--format", "json",
+                         str(self.cpp["fixture"])])
+        try:
+            report = json.loads(proc.stdout)
+        except ValueError as error:
+            self.expect(False, "invalid JSON: %s" % error)
+            return
+        self.expect(report.get("mode") == "routes", "JSON mode field wrong")
+        self.expect(isinstance(report.get("warnings"), list),
+                    "JSON warnings missing")
+        entries = report.get("entries", [])
+        self.expect(bool(entries), "JSON has no entries")
+        for key in ("name", "mangled", "demangled", "reason", "trigger",
+                    "signature", "file", "line", "end_line"):
+            self.expect(key in entries[0], "JSON entry lacks %s" % key)
+        self.expect(any("http_get_user" in e["mangled"] for e in entries),
+                    "JSON lost a route handler")
+        self.expect(any(e["file"] and e["line"] > 0 for e in entries),
+                    "JSON should carry DWARF source locations")
+
+    def test_filter_and_entry_name(self):
+        patterns = self.work / "advanced_filters.txt"
+        patterns.write_text("# drop one handler\n^h_load$\n",
+                            encoding="utf-8")
+        filtered = self.run(["--mode", "routes", "--verbose", "--filter-file",
+                             str(patterns), str(self.bc["value_flow"])])
+        self.expect("h_load" not in filtered.stdout,
+                    "--filter-file did not exclude h_load")
+        named = self.run(["--mode", "roots", "--verbose", "--entry-name",
+                          "h_sel*", str(self.bc["value_flow"])])
+        self.expect(any("h_select" in line and "program-entry" in line
+                        for line in named.stdout.splitlines()),
+                    "--entry-name should mark h_select as a program entry")
+
+    def test_type_erased_and_reachability(self):
+        rows = self.run(["--mode", "routes", "--demangle", "--verbose",
+                         str(self.cpp["advanced"])])
+        self.expect("$_0" in rows.stdout and
+                    "registered-handler" in rows.stdout,
+                    "capturing lambda target not recovered")
+        disabled = self.run(["--mode", "routes", "--demangle", "--verbose",
+                             "--no-type-erased", str(self.cpp["advanced"])])
+        self.expect("$_0" not in disabled.stdout,
+                    "--no-type-erased should drop the lambda target")
+        roots = self.run(["--mode", "roots", str(self.cpp["advanced"])])
+        self.expect("dead_handler" in roots.stdout.splitlines(),
+                    "dead-code direct callers must not hide an entry")
+        legacy = self.run(["--mode", "roots", "--legacy-roots",
+                           str(self.cpp["advanced"])])
+        self.expect("dead_handler" not in legacy.stdout.splitlines(),
+                    "--legacy-roots should restore the old behaviour")
+        exported = self.run(["--mode", "exported",
+                             str(self.cpp["advanced"])])
+        names = exported.stdout.splitlines()
+        self.expect("hidden_api" not in names,
+                    "hidden-visibility symbol must not be exported")
+        self.expect("alias_target" in names,
+                    "target of an external alias must be exported")
+
+    def test_optimized_bitcode_diagnostics(self):
+        import json
+        proc = self.run(["--mode", "roots", "--format", "json",
+                         str(self.cpp["advanced_opt"])])
+        try:
+            report = json.loads(proc.stdout)
+        except ValueError as error:
+            self.expect(False, "invalid JSON: %s" % error)
+            return
+        self.expect(any("optimised" in w or "debug info" in w
+                        for w in report.get("warnings", [])),
+                    "-O2 bitcode should carry a stability warning")
+        self.expect(bool(report.get("entries")),
+                    "-O2 bitcode produced no entries")
 
     # -- driver ------------------------------------------------------------
 

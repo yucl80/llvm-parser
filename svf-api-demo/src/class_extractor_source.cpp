@@ -13,7 +13,7 @@
 // resulting classinfo::ClassReport itself.
 //===----------------------------------------------------------------------===//
 
-#include "class_report.h"
+#include "class_extractor_report.h"
 
 #include <clang-c/Index.h>
 

@@ -27,7 +27,7 @@ bases and inheritance. Its input file type selects the backend:
 | `.c`, `.cpp`, `.h`, ... (C/C++ sources) | `src/class_extractor_source.cpp` — libclang C API |
 
 `src/class_extractor_cli.cpp` is the single entry point (type detection + dispatch),
-`include/class_report.h` / `src/class_extractor_report.cpp` hold the shared report model
+`include/class_extractor_report.h` / `src/class_extractor_report.cpp` hold the shared report model
 and the JSON/text writers. Extension-less inputs are classified by content;
 `--input-type bitcode|source` forces a backend.
 
