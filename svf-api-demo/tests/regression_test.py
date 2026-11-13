@@ -84,6 +84,26 @@ class Suite:
                  str(src), "-o", str(out)],
                 check=True, capture_output=True, text=True, timeout=180)
             self.bc[key] = str(out)
+        cross_cpp_main = work / "cross_cpp_main.cpp"
+        cross_cpp_target = work / "cross_cpp_target.cpp"
+        cross_cpp_main.write_text(
+            "extern void cppCrossModuleTarget();\n"
+            "int main() {\n"
+            "  void (*callback)() = cppCrossModuleTarget;\n"
+            "  callback();\n"
+            "  return 0;\n"
+            "}\n",
+            encoding="utf-8")
+        cross_cpp_target.write_text(
+            "void cppCrossModuleTarget() {}\n", encoding="utf-8")
+        for key, src in (("cross_cpp_main", cross_cpp_main),
+                         ("cross_cpp_target", cross_cpp_target)):
+            out = work / (key + ".bc")
+            subprocess.run(
+                [args.clangxx, "-std=c++17", "-O0", "-g", "-emit-llvm",
+                 "-c", str(src), "-o", str(out)],
+                check=True, capture_output=True, text=True, timeout=180)
+            self.bc[key] = str(out)
         same_main = work / "same_name_main.c"
         same_target = work / "same_name_target.c"
         same_main.write_text(
@@ -171,6 +191,26 @@ class Suite:
                 return int(line.split("spans=")[1].split()[0])
         return -1
 
+    @staticmethod
+    def call_edges(parsed):
+        spans_by_id = {row[0]: row for row in parsed.spans
+                       if len(row) == 12}
+        return {
+            (spans_by_id[row[1]][5], row[5], row[2])
+            for row in parsed.spans
+            if len(row) == 12 and row[1] in spans_by_id
+        }
+
+    @staticmethod
+    def cycle_edges(parsed):
+        spans_by_id = {row[0]: row for row in parsed.spans
+                       if len(row) == 12}
+        return {
+            (spans_by_id[row[1]][5], row[5], row[2])
+            for row in parsed.spans
+            if len(row) == 12 and row[4] == "1" and row[1] in spans_by_id
+        }
+
     def entry_blocks(self, text):
         """Split a multi-entry TSV report into name -> parsed spans."""
         blocks = {}
@@ -245,6 +285,15 @@ class Suite:
                         "cross-module function pointer was not resolved: %s\n%s" %
                         (p.functions, r.log))
 
+    def test_cpp_function_pointer_across_modules(self):
+        r = self.run_analyzer([
+            self.bc["cross_cpp_main"], self.bc["cross_cpp_target"]])
+        p = self.parse(r.text)
+        edges = self.call_edges(p)
+        self.expect(r.rc == 0, "C++ multi-module analysis failed: %s" % r.log)
+        self.expect(("main", "cppCrossModuleTarget", "indirect") in edges,
+                    "C++ function pointer target was not resolved across modules")
+
     def test_same_named_internal_functions_across_modules(self):
         r = self.run_analyzer([
             self.bc["same_name_main"], self.bc["same_name_target"]])
@@ -297,6 +346,56 @@ class Suite:
         self.expect(self.span_count(r.text) == len(p.spans),
                     "#end span count disagrees with the report")
 
+        edges = self.call_edges(p)
+        expected_edges = {
+            ("testCallbackParam", "sortWithCallback", "direct"),
+            ("sortWithCallback", "compareAsc", "indirect"),
+            ("sortWithCallback", "compareDesc", "indirect"),
+            ("testGlobalCallbackFlow", "setGlobalHandler", "direct"),
+            ("testGlobalCallbackFlow", "forwardGlobalHandler", "direct"),
+            ("forwardGlobalHandler", "invokeGlobalHandler", "direct"),
+            ("invokeGlobalHandler", "globalHandlerA", "indirect"),
+            ("invokeGlobalHandler", "globalHandlerB", "indirect"),
+            ("testQualifiedVirtualCall", "Derived::virtualMethod", "indirect"),
+            ("testQualifiedVirtualCall", "Base::virtualMethod", "direct"),
+            ("testFactoryPattern", "Dog::speak", "indirect"),
+            ("testFactoryPattern", "Cat::speak", "indirect"),
+            ("testDynamicCastFailure", "Animal::speak", "indirect"),
+            ("testStructPtrSetter", "svcA", "indirect"),
+            ("testStructPtrSetter", "svcB", "indirect"),
+            ("testGuardedCallback", "onTrue", "indirect"),
+            ("indirectCycleA", "indirectCycleB", "direct"),
+            ("indirectCycleB", "indirectCycleA", "indirect"),
+        }
+        missing_edges = expected_edges - edges
+        self.expect(not missing_edges,
+                    "missing expected call edges: %s" %
+                    sorted(missing_edges))
+        failed_cast_targets = {
+            callee for caller, callee, _ in edges
+            if caller == "testDynamicCastFailure"
+        }
+        self.expect("Dog::speak" not in failed_cast_targets,
+                    "failed downcast unexpectedly reached Dog::speak")
+        self.expect(
+            ("indirectCycleB", "indirectCycleA", "indirect")
+            in self.cycle_edges(p),
+            "indirect-recursion back-edge is not marked as a cycle")
+
+        # This fixture intentionally copies function pointers from a global
+        # constant array; that case requires the heap object model.
+        heap = self.run_analyzer([
+            "--heap-model", "--entry", "testStructPtrToFuncPtr",
+            self.bc["complex"]])
+        hp = self.parse(heap.text)
+        heap_edges = self.call_edges(hp)
+        self.expect(heap.rc == 0, "heap-model analysis failed: %s" % heap.log)
+        self.expect(("testStructPtrToFuncPtr", "regA", "indirect")
+                    in heap_edges and
+                    ("testStructPtrToFuncPtr", "regB", "indirect")
+                    in heap_edges,
+                    "global-constant memcpy targets were not both resolved")
+
         inc = self.run_analyzer(["--include-stdlib", self.bc["complex"]])
         pi = self.parse(inc.text)
         self.expect(inc.rc == 0, "include-stdlib run failed")
@@ -305,6 +404,19 @@ class Suite:
                     "--include-stdlib should reveal additional spans")
         self.expect(any("std::" in f for f in pi.functions),
                     "--include-stdlib should reveal std:: functions")
+
+    def test_inherited_member_function_pointer_limitation(self):
+        # Current SVF/LLVM handling does not recover the target encoded in a
+        # C++ pointer-to-member ABI value; keep this hard case explicit.
+        r = self.run_analyzer([
+            "--entry", "testInheritedMemberFuncPtr", self.bc["complex"]])
+        p = self.parse(r.text)
+        self.expect(r.rc == 0, "member-pointer analysis failed: %s" % r.log)
+        self.expect("testInheritedMemberFuncPtr" in p.functions,
+                    "member-pointer fixture was not analyzed")
+        self.expect("MemberPointerBase::apply" not in p.functions,
+                    "update this characterization when member-pointer "
+                    "resolution is implemented")
 
     def test_tree_complex_markers(self):
         r = self.run_analyzer([self.bc["complex"]], fmt="tree")

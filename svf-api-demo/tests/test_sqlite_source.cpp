@@ -59,7 +59,7 @@ struct QSqlQuery {
     bool exec(const char *sql);
 };
 
-static bool execQuery(const char *sql);
+bool execQuery(const char *sql);
 
 int runAll(sqlite3 *db, const char *table) {
     // Plain literal.

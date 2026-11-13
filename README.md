@@ -6,13 +6,13 @@ SVF-based call graph analysis tool that performs Andersen-style pointer analysis
 
 ### Analyzer
 
-- **`svf-api-demo/src/main.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and renders per-entry call graphs (ASCII tree by default, or tab-separated spans).
+- **`svf-api-demo/src/callgraph_cli.cpp`** — CLI driver: parses flags, loads LLVM bitcode, runs the pointer analysis, and renders per-entry call graphs (ASCII tree by default, or tab-separated spans).
 - **`svf-api-demo/src/callgraph_analysis.cpp`** / **`svf-api-demo/include/callgraph_analysis.h`** — Analysis core (`analyzeCallGraph`) and `AnalysisConfig`.
 - **`svf-api-demo/src/callgraph_output.cpp`** / **`svf-api-demo/include/callgraph_output.h`** — Report writer: call-graph traversal into spans, metadata header, per-entry sink dispatch.
 - **`svf-api-demo/src/callgraph_tsv_sink.cpp`** / **`svf-api-demo/include/callgraph_tsv_sink.h`** — `TsvSink` (machine-readable tab-separated spans) plus the shared span-line/escaping writers.
 - **`svf-api-demo/src/callgraph_tree_sink.cpp`** / **`svf-api-demo/include/callgraph_tree_sink.h`** — `TreeSink` (indented ASCII call tree per entry).
 - **`svf-api-demo/include/callgraph_sink.h`** / **`svf-api-demo/include/callgraph_span.h`** — `SpanSink` traversal-output interface and the shared span data types.
-- **`svf-api-demo/src/function_filter.cpp`** / **`svf-api-demo/include/function_filter.h`** — Library-code classification, user filter patterns, and debug-line ranges.
+- **`svf-api-demo/src/callgraph_function_filter.cpp`** / **`svf-api-demo/include/function_filter.h`** — Library-code classification, user filter patterns, and debug-line ranges.
 - **`svf-api-demo/CMakeLists.txt`** — CMake build (out-of-source into `build/`): builds the analyzer, the native test program, and the test bitcode.
 - **`svf-api-demo/build/clang_analyzer`** — Compiled analyzer binary (CMake build output).
 

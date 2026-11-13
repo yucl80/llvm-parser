@@ -54,7 +54,7 @@ add_library(svfanalyzer STATIC
     src/callgraph_output.cpp
     src/callgraph_tsv_sink.cpp
     src/callgraph_tree_sink.cpp
-    src/function_filter.cpp)
+    src/callgraph_function_filter.cpp)
 target_include_directories(svfanalyzer PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(svfanalyzer SYSTEM PUBLIC
@@ -67,17 +67,17 @@ target_link_libraries(svfanalyzer PUBLIC
 # ---------------------------------------------------------------------------
 # Analyzer CLI driver: ./clang_analyzer [flags] <bitcode-file>
 # ---------------------------------------------------------------------------
-add_executable(clang_analyzer src/main.cpp)
+add_executable(clang_analyzer src/callgraph_cli.cpp)
 target_link_libraries(clang_analyzer PRIVATE svfanalyzer)
 
 # ---------------------------------------------------------------------------
 # Bitcode entry-function lister: ./entry_extractor [options] <bitcode-file>
 # Standalone LLVM tool: parses the module with IRReader, no SVF needed.
-# function_filter.cpp supplies the DWARF-based app/library classification.
+# callgraph_function_filter.cpp supplies the DWARF-based app/library classification.
 # ---------------------------------------------------------------------------
 add_executable(entry_extractor
     src/entry_extractor.cpp
-    src/function_filter.cpp)
+    src/callgraph_function_filter.cpp)
 target_include_directories(entry_extractor PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(entry_extractor SYSTEM PRIVATE "${LLVM_INCLUDE_DIR}")

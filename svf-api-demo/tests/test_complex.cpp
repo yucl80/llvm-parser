@@ -3,6 +3,7 @@
 //         complex struct pointer passing, and C++ syntactic sugar expansion
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <variant>
@@ -157,6 +158,35 @@ void testCallbackParam() {
     int arr1[] = {3, 1, 4, 1, 5};
     sortWithCallback(arr1, 5, compareAsc);
     sortWithCallback(arr1, 5, compareDesc);
+}
+
+// ===== Global callback stored and invoked through multiple call layers =====
+typedef void (*GlobalHandler)(int);
+
+GlobalHandler globalHandler = nullptr;
+
+void setGlobalHandler(GlobalHandler handler) {
+    globalHandler = handler;
+}
+
+void invokeGlobalHandler(int value) {
+    if (globalHandler) {
+        globalHandler(value);
+    }
+}
+
+void forwardGlobalHandler(int value) {
+    invokeGlobalHandler(value);
+}
+
+void globalHandlerA(int value) { printf("global handler A: %d\n", value); }
+void globalHandlerB(int value) { printf("global handler B: %d\n", value); }
+
+void testGlobalCallbackFlow() {
+    setGlobalHandler(globalHandlerA);
+    forwardGlobalHandler(1);
+    setGlobalHandler(globalHandlerB);
+    forwardGlobalHandler(2);
 }
 
 // ===== Pointer to function pointer (double indirection) =====
@@ -361,6 +391,24 @@ void testMemberFuncPtr() {
 
     op = &Calculator::mul;
     (calc.*op)(10, 5);
+}
+
+// ===== Inherited non-virtual member-function pointer =====
+struct MemberPointerPrefix {
+    virtual ~MemberPointerPrefix() = default;
+    int prefix = 0;
+};
+
+struct MemberPointerBase {
+    void apply(int value) { printf("member pointer base: %d\n", value); }
+};
+
+struct MemberPointerDerived : MemberPointerPrefix, MemberPointerBase {};
+
+void testInheritedMemberFuncPtr() {
+    MemberPointerDerived object;
+    void (MemberPointerBase::*action)(int) = &MemberPointerBase::apply;
+    (object.*action)(42);
 }
 
 // ===== 18. Functor (Function Object) =====
@@ -920,6 +968,28 @@ void testRecursiveLambda() {
     (void)r;
 }
 
+// ===== Indirect recursion through a function pointer =====
+typedef void (*RecursiveHandler)(int);
+
+void indirectCycleA(int n);
+
+void indirectCycleB(int n) {
+    if (n > 0) {
+        RecursiveHandler next = indirectCycleA;
+        next(n - 1);
+    }
+}
+
+void indirectCycleA(int n) {
+    if (n > 0) {
+        indirectCycleB(n - 1);
+    }
+}
+
+void testIndirectRecursiveCallback() {
+    indirectCycleA(2);
+}
+
 // ================================================================
 // 46+: Complex Struct Pointer Passing & C++ Syntactic Sugar
 // ================================================================
@@ -1071,8 +1141,6 @@ void testStructArrayPtr() {
 }
 
 // ===== 52. Struct field pointing to a function pointer (double indirection) =====
-// NOTE: the fn-pointers arrive via memcpy from a *global constant* array,
-// so this resolves only with --heap-model (ModelConsts), not baseline Andersen.
 struct Registry {
     void (**slot)();
 };
@@ -1080,8 +1148,12 @@ struct Registry {
 void regA() { printf("reg A\n"); }
 void regB() { printf("reg B\n"); }
 
+using RegistryHandler = void (*)();
+const RegistryHandler registryHandlers[] = {regA, regB};
+
 void testStructPtrToFuncPtr() {
-    void (*fns[2])() = {regA, regB};
+    RegistryHandler fns[2];
+    std::memcpy(fns, registryHandlers, sizeof(registryHandlers));
     Registry r = {&fns[0]};
     (*(r.slot))();    // load fn-ptr-ptr, load fn-ptr, indirect call
     r.slot = &fns[1];
@@ -1136,6 +1208,14 @@ void testVirtualRefParam() {
     speakViaRef(cat);
 }
 
+// ===== Qualified virtual call suppresses dynamic dispatch =====
+void testQualifiedVirtualCall() {
+    Derived derived;
+    Base* base = &derived;
+    base->virtualMethod();
+    base->Base::virtualMethod();
+}
+
 // ===== 56. dynamic_cast downcast then virtual call (RTTI sugar) =====
 void testDynamicCast() {
     Animal* a = new Dog();
@@ -1144,6 +1224,16 @@ void testDynamicCast() {
         d->speak();
     }
     delete a;
+}
+
+// ===== Failed dynamic_cast from a polymorphic base object =====
+void testDynamicCastFailure() {
+    Animal* animal = new Animal();
+    Dog* dog = dynamic_cast<Dog*>(animal);
+    if (dog) {
+        dog->speak();
+    }
+    delete animal;
 }
 
 // ===== 57. new[]/delete[] array allocation sugar =====
@@ -1191,6 +1281,19 @@ void testTernaryAsArg() {
     callOnce(flag ? onTrue : onFalse);   // no intermediate variable
     flag = 0;
     callOnce(flag ? onTrue : onFalse);
+}
+
+// ===== Guarded null callback and reassignment =====
+void testGuardedCallback() {
+    FuncPtr handler = nullptr;
+    if (handler) {
+        handler();
+    }
+
+    handler = onTrue;
+    if (handler) {
+        handler();
+    }
 }
 
 // ===== 60. Operator overloading sugar (operator[] / operator->) =====
@@ -1356,6 +1459,7 @@ int main() {
     testLambda();
     testFuncPtrArray();
     testCallbackParam();
+    testGlobalCallbackFlow();
     testPtrToFuncPtr();
     testStructFuncPtr();
     testReturnFuncPtr();
@@ -1367,6 +1471,7 @@ int main() {
     testDiamondVirtualInheritance();
     testStdFunction();
     testMemberFuncPtr();
+    testInheritedMemberFuncPtr();
     testFunctor();
     testRecursion();
     testFunctionTemplates();
@@ -1396,6 +1501,7 @@ int main() {
     testOverloadedLambda();
     testVariantVisit();
     testRecursiveLambda();
+    testIndirectRecursiveCallback();
 
     // Complex struct pointer passing
     testNestedStructPtr();
@@ -1410,10 +1516,13 @@ int main() {
     // C++ syntactic sugar
     testRangeFor();
     testVirtualRefParam();
+    testQualifiedVirtualCall();
     testDynamicCast();
+    testDynamicCastFailure();
     testArrayNewDelete();
     testMoveSemantics();
     testTernaryAsArg();
+    testGuardedCallback();
     testSubscriptOperator();
     testArrowOperator();
     testMagicStatic();
