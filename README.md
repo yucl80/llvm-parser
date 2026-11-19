@@ -93,6 +93,61 @@ remain `dynamic`.
 `svf-api-demo/tests/sql_extractor_test.py` is its CTest regression suite
 (`sql_extractor_regression`).
 
+### Network Calls in Loops
+
+`svf-api-demo/build/network_loop_analyzer` analyzes C/C++ source with libclang
+and reports calls made from `for`, `while`, `do` and range-for loop bodies that
+reach known network APIs, either directly or through local direct-call chains.
+The built-in API list covers common libcurl, socket, TLS, WinHTTP, cpp-httplib,
+CPR, Boost.Asio/Beast and Poco HTTP calls. Add project-specific client entry
+points with repeatable `--api` options.
+
+```bash
+./svf-api-demo/build/network_loop_analyzer --format json src/client.cpp -- \
+    -std=c++17 -Iinclude
+./svf-api-demo/build/network_loop_analyzer --api MyHttpClient::request \
+    src/client.cpp -- -std=c++17
+```
+
+The report includes the loop and call locations, the network API reached and
+the call chain. The analyzer follows statically identifiable function-pointer
+initializers/assignments and callback arguments, including lambda callbacks.
+Runtime-dependent or virtual dispatch and callback implementations it cannot
+resolve can still be missed. Add project-specific network entry-point names
+with `--api`.
+
+### C++ Defect Analysis from Bitcode
+
+`svf-api-demo/build/bitcode_vulnerability_analyzer` scans LLVM bitcode / IR
+(`.bc` / `.ll`) for common memory-safety, unsafe-API, concurrency,
+uninitialized-read, nested-loop and resource-lifetime issues.
+
+```bash
+./svf-api-demo/build/bitcode_vulnerability_analyzer --format json \
+    build/tests/program.bc
+```
+
+Unsafe-API checks use available call-site evidence instead of treating every
+use of a risky API as a confirmed defect: scanf string/character field widths
+are compared with known destination sizes; known oversized `memcpy` /
+`memmove`, `read` / `recv`, and `snprintf` lengths are reported; and a
+constant `strcpy` source is not reported when it fits a known destination.
+Constant shell commands and constant output format strings are also excluded
+from injection findings. APIs that provide no destination bound (such as
+`gets`, `getwd`, `sprintf`, and insecure temporary-name generators) remain
+reported. Runtime validation, sanitization and path-sensitive bounds are not
+generally proven, so findings are heuristic candidates rather than proof of a
+defect, and unreported calls are not guaranteed safe.
+
+Resource-lifetime checks recognize common heap (including `realloc`),
+`new`/`delete`, file-stream, file-descriptor, socket and Windows-handle APIs.
+They report likely leaks, incompatible release functions and repeated
+releases, and flag allocations in loops that lack same-block cleanup. Analysis
+also summarizes direct resource-returning wrappers and simple single-block
+release wrappers. Indirect calls, custom allocators and more complex
+cross-function ownership remain outside these summaries, so findings are
+heuristic candidates rather than proof of a defect.
+
 ### SQLite SQL Scripts from Bitcode
 
 `svf-api-demo/build/sql_bitcode_extractor` extracts the same SQLite SQL reports

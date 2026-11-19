@@ -151,6 +151,41 @@ set_target_properties(sql_extractor PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
 
 # ---------------------------------------------------------------------------
+# Network calls in loop bodies: source-level call graph walk with libclang.
+# ---------------------------------------------------------------------------
+add_executable(network_loop_analyzer src/bug_anayzer_network_loop.cpp)
+target_compile_options(network_loop_analyzer PRIVATE -Wall -Wextra)
+target_include_directories(network_loop_analyzer SYSTEM PRIVATE
+    "${LLVM_INCLUDE_DIR}")
+target_link_libraries(network_loop_analyzer PRIVATE
+    "${CLANG_LIB}" ${CMAKE_DL_LIBS})
+set_target_properties(network_loop_analyzer PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
+# Bitcode bug analyzer CLI with separately registered bug_analyzer_* plugins.
+# ---------------------------------------------------------------------------
+add_executable(bitcode_vulnerability_analyzer
+    src/bug_analyzer_cli.cpp
+    src/bug_analyzer_plugin.cpp
+    src/bug_analyzer_common.cpp
+    src/bug_analyzer_memory_safety.cpp
+    src/bug_analyzer_concurrency.cpp
+    src/bug_analyzer_uninitialized.cpp
+    src/bug_analyzer_unsafe_api.cpp
+    src/bug_analyzer_nested_loops.cpp
+    src/bug_analyzer_resource_lifetime.cpp
+    include/bug_analyzer_plugin.h)
+target_compile_options(bitcode_vulnerability_analyzer PRIVATE -Wall -Wextra)
+target_include_directories(bitcode_vulnerability_analyzer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(bitcode_vulnerability_analyzer SYSTEM PRIVATE
+    "${LLVM_INCLUDE_DIR}")
+target_link_libraries(bitcode_vulnerability_analyzer PRIVATE "${LLVM_LIB}")
+set_target_properties(bitcode_vulnerability_analyzer PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+
+# ---------------------------------------------------------------------------
 # Class/method change detector: ./class_diff [options] <old> <new> [-- args]
 #
 # Parses two C/C++ projects (source trees with libclang, .bc/.ll with LLVM IR
@@ -360,6 +395,43 @@ if(Python3_Interpreter_FOUND)
               --extractor "$<TARGET_FILE:sql_extractor>"
               --source-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests")
   set_tests_properties(sql_extractor_regression PROPERTIES TIMEOUT 300)
+
+  add_test(NAME network_loop_analyzer_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/bug_anayzer_network_loop_test.py"
+              --analyzer "$<TARGET_FILE:network_loop_analyzer>")
+  set_tests_properties(network_loop_analyzer_regression PROPERTIES TIMEOUT 120)
+
+  function(add_bug_analyzer_regression name script)
+    add_test(NAME "${name}"
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/${script}"
+                --analyzer "$<TARGET_FILE:bitcode_vulnerability_analyzer>"
+                --clangxx "${LLVM_PREFIX}/bin/clang++")
+    set_tests_properties("${name}" PROPERTIES TIMEOUT 120)
+  endfunction()
+
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_memory_safety_regression
+      bug_analyzer_memory_safety_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_unsafe_api_regression
+      bug_analyzer_unsafe_api_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_resource_lifetime_regression
+      bug_analyzer_resource_lifetime_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_concurrency_regression
+      bug_analyzer_concurrency_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_uninitialized_regression
+      bug_analyzer_uninitialized_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_nested_loops_regression
+      bug_analyzer_nested_loops_test.py)
+  add_bug_analyzer_regression(
+      bitcode_vulnerability_analyzer_cli_regression
+      bug_analyzer_cli_test.py)
 
   # Bitcode SQL extractor suite: parses the shared SQLite fixture and asserts
   # static SQL, function/indirect-call candidates and dynamic values.
