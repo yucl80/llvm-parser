@@ -169,17 +169,93 @@ static bool isStdLibFunction(const std::string& mangled,
         "__cxa_", "__gxx_", "_Unwind_",       // C++ ABI / unwinder
         "__asan_", "__ubsan_", "__tsan_", "__msan_", "__sanitizer_",
         "__stack_chk_", "__fortify_",         // hardening hooks
+        "__libc_", "__GI_", "__pthread_", "__emutls_", "__tls_",
+        "__aeabi_", "__builtin_", "llvm.", // libc/compiler/emulated TLS helpers
+        "_GLOBAL__sub_I_", "__cxx_global_var_init",
+        "__do_global_dtors_aux", "__do_global_ctors_aux",
+        "register_tm_clones", "deregister_tm_clones", "frame_dummy",
+        ".llvm.",                               // LLVM-generated helper names
     };
     for (const char* prefix : kRuntimePrefixes)
-        if (demangled.rfind(prefix, 0) == 0) return true;
+        if (demangled.rfind(prefix, 0) == 0 ||
+            mangled.rfind(prefix, 0) == 0)
+            return true;
 
     if (demangled == "__clang_call_terminate") return true;
 
-    // operator new/delete carry parameter lists ("operator new(unsigned long)");
-    // strip them before the exact-name match.
-    const std::string base = stripParams(demangled);
-    return base == "operator new" || base == "operator new[]" ||
-           base == "operator delete" || base == "operator delete[]";
+    // Standard C runtime functions and fortified/versioned variants.  Keep
+    // this exact-name-based (rather than matching every "malloc*" or "free*")
+    // so application functions such as malloc_helper, free_cache or
+    // pthread_custom are not mistaken for runtime symbols.
+    static constexpr const char* kRuntimeNames[] = {
+        "malloc", "calloc", "realloc", "reallocarray", "aligned_alloc",
+        "memalign", "posix_memalign", "valloc", "pvalloc",
+        "free", "cfree",
+        "memcpy", "memmove", "memset", "memcmp", "bcopy", "bzero",
+        "strlen", "strnlen", "strcpy", "strncpy", "stpcpy",
+        "strcat", "strncat", "strcmp", "strncmp", "strchr", "strrchr",
+        "strdup", "strndup", "strerror", "strtol", "strtoul",
+        "__libc_malloc", "__libc_calloc", "__libc_realloc",
+        "__libc_free", "__libc_cfree",
+        "__malloc", "__calloc", "__realloc", "__free",
+        "__memcpy_chk", "__memmove_chk", "__memset_chk",
+        "__memcpy", "__memmove", "__memset",
+        "__errno_location", "__libc_start_main",
+        "pthread_create", "pthread_join", "pthread_exit",
+        "pthread_mutex_init", "pthread_mutex_destroy",
+        "pthread_mutex_lock", "pthread_mutex_trylock",
+        "pthread_mutex_timedlock", "pthread_mutex_unlock",
+        "pthread_rwlock_init", "pthread_rwlock_destroy",
+        "pthread_rwlock_rdlock", "pthread_rwlock_tryrdlock",
+        "pthread_rwlock_wrlock", "pthread_rwlock_trywrlock",
+        "pthread_rwlock_timedrdlock", "pthread_rwlock_timedwrlock",
+        "pthread_rwlock_unlock", "pthread_spin_init",
+        "pthread_spin_destroy", "pthread_spin_lock",
+        "pthread_spin_trylock", "pthread_spin_unlock",
+        "dlopen", "dlclose", "dlsym", "dlvsym",
+    };
+    for (const char* name : kRuntimeNames)
+        if (demangled == name)
+            return true;
+
+    // Linux IFUNC/symbol-versioned implementations append ".isa"/".sse4",
+    // ".avx2", etc.  Only known runtime names are versioned; e.g.
+    // "memcpy_custom" remains application code.
+    for (const char* name : kRuntimeNames) {
+        if (demangled.compare(0, std::strlen(name), name) == 0 &&
+            demangled[std::strlen(name)] == '.') {
+            const std::string suffix =
+                demangled.substr(std::strlen(name) + 1);
+            if (suffix.rfind("sse", 0) == 0 ||
+                suffix.rfind("avx", 0) == 0 ||
+                suffix.rfind("generic", 0) == 0 ||
+                suffix.rfind("ifunc", 0) == 0)
+                return true;
+        }
+    }
+
+    // operator new/delete: standard signatures only.  A custom signature such
+    // as operator new(unsigned long, MyPool&) is application code.
+    if (demangled == "operator new(unsigned long)" ||
+        demangled == "operator new(unsigned long, std::nothrow_t const&)" ||
+        demangled == "operator new[](unsigned long)" ||
+        demangled == "operator new[](unsigned long, std::nothrow_t const&)") {
+        return true;
+    }
+    if (demangled.rfind("operator delete(unsigned long", 0) == 0 ||
+        demangled.rfind("operator delete[](unsigned long", 0) == 0) {
+        // Sized deallocation and standard unsized forms.  Require either a
+        // closing standard parameter list or no extra application pool argument.
+        if (demangled == "operator delete(void*)" ||
+            demangled == "operator delete(void*, unsigned long)" ||
+            demangled == "operator delete(void*, std::nothrow_t const&)" ||
+            demangled == "operator delete[](void*)" ||
+            demangled == "operator delete[](void*, unsigned long)" ||
+            demangled == "operator delete[](void*, std::nothrow_t const&)")
+            return true;
+    }
+    return demangled == "operator delete(void*)" ||
+           demangled == "operator delete[](void*)";
 }
 
 /// Fallback when the module has no compile units: Linux system headers all

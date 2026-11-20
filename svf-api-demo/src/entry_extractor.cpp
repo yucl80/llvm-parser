@@ -550,7 +550,15 @@ bool looksLikeRuntimeSymbol(const std::string& mangled,
         "__asan_", "__ubsan_", "__tsan_", "__msan_", "__sanitizer_",
         "__stack_chk_", "__fortify_", "_GLOBAL__sub_I_",
         "__cxx_global_var_init", "__clang_call_terminate", "operator new",
-        "operator delete", "llvm.", "non-virtual thunk to ",
+        "operator delete", "llvm.", "__libc_", "__GI_", "__pthread_",
+        "__emutls_", "__tls_", "__aeabi_", "__builtin_",
+        "__do_global_dtors_aux", "__do_global_ctors_aux",
+        "register_tm_clones", "deregister_tm_clones", "frame_dummy",
+        "malloc", "calloc", "realloc", "reallocarray", "aligned_alloc",
+        "free", "memcpy", "memmove", "memset", "memcmp",
+        "pthread_create", "pthread_join", "pthread_exit",
+        "pthread_mutex_", "pthread_rwlock_", "pthread_spin_", "dlopen",
+        "dlclose", "dlsym", "dlvsym", "non-virtual thunk to ",
         "virtual thunk to "};
     for (const char* p : kNames)
         if (demangled.rfind(p, 0) == 0)

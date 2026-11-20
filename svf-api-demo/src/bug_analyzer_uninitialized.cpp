@@ -9,6 +9,7 @@
 #include <llvm/IR/Operator.h>
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -179,6 +180,8 @@ std::vector<MemoryLocation> resolveMemoryLocations(
         } else {
             const int64_t offset = byteOffset.getSExtValue();
             for (MemoryLocation& location : locations) {
+                if (location.unknownOffset)
+                    continue;
                 if ((offset > 0 &&
                      location.offset >
                          std::numeric_limits<int64_t>::max() - offset) ||
@@ -264,6 +267,28 @@ PointerReferences buildPointerReferences(
         }
     };
     using SlotState = std::map<const llvm::AllocaInst*, SlotValue>;
+    // A loop that advances a pointer slot (e.g. a range-based for) can make
+    // the same object appear with a different offset on every iteration.
+    // Widen such merges to an unknown offset, otherwise the fixpoint never
+    // converges because each iteration adds one more offset to the set.
+    auto widenMergedState = [](SlotState& state) {
+        for (auto& entry : state) {
+            std::set<MemoryLocation> widened;
+            for (auto first = entry.second.locations.begin();
+                 first != entry.second.locations.end();) {
+                auto last = first;
+                while (last != entry.second.locations.end() &&
+                       last->object == first->object)
+                    ++last;
+                if (std::next(first) == last)
+                    widened.insert(*first);
+                else
+                    widened.insert(MemoryLocation{first->object, 0, true});
+                first = last;
+            }
+            entry.second.locations = std::move(widened);
+        }
+    };
     std::vector<const llvm::AllocaInst*> slots;
     for (const llvm::BasicBlock& block : function) {
         for (const llvm::Instruction& instruction : block) {
@@ -280,6 +305,10 @@ PointerReferences buildPointerReferences(
 
     bool referencesChanged;
     do {
+        // Only compare the settled map: in/out are rebuilt on every pass, so
+        // transient reference changes inside a pass must not keep the outer
+        // fixpoint running.
+        const PointerReferences previousReferences = references;
         referencesChanged = false;
         std::unordered_map<const llvm::BasicBlock*, SlotState> in, out;
         bool changed;
@@ -305,6 +334,7 @@ PointerReferences buildPointerReferences(
                                 value.unknown || entry.second.unknown;
                         }
                     }
+                    widenMergedState(nextIn);
                 }
 
                 SlotState nextOut = nextIn;
@@ -341,8 +371,7 @@ PointerReferences buildPointerReferences(
                         const auto value = nextOut.find(slot);
                         if (value == nextOut.end() || value->second.unknown ||
                             value->second.locations.empty()) {
-                            if (references.erase(load) != 0)
-                                referencesChanged = true;
+                            references.erase(load);
                             continue;
                         }
                         std::vector<MemoryLocation> locations(
@@ -350,10 +379,8 @@ PointerReferences buildPointerReferences(
                             value->second.locations.end());
                         const auto current = references.find(load);
                         if (current == references.end() ||
-                            current->second != locations) {
+                            current->second != locations)
                             references[load] = std::move(locations);
-                            referencesChanged = true;
-                        }
                     }
                 }
 
@@ -364,6 +391,7 @@ PointerReferences buildPointerReferences(
                 }
             }
         } while (changed);
+        referencesChanged = references != previousReferences;
     } while (referencesChanged);
     return references;
 }
