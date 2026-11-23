@@ -6,6 +6,7 @@
 #include <iosfwd>
 #include <optional>
 #include <string>
+#include <string_view>
 
 /// Escape a string for embedding in a tab-separated field: the separators that
 /// would break the line (tab, newline, CR) plus the escape character itself.
@@ -20,7 +21,7 @@ void writeSpanLine(std::ostream& os,
                    const FuncInfo& info,
                    unsigned span_id,
                    const std::optional<unsigned>& parent_span_id,
-                   const std::string& kind,
+                   std::string_view kind,
                    unsigned depth,
                    bool cycle,
                    const std::optional<CallSiteLoc>& call_loc);

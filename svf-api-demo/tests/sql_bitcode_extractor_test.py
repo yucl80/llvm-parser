@@ -3,7 +3,8 @@
 
 CMake compiles the shared test_sqlite_source.cpp fixture with -g and passes it
 via --bitcode. The suite asserts SQL extraction, SVF-resolved indirect-call
-candidates, dynamic values, output layouts and CLI error paths.
+candidates, dynamic values, output layouts, --no-dispatch, --unique counting
+and CLI error paths (including unreadable bitcode and malformed --api).
 """
 
 import argparse
@@ -178,6 +179,40 @@ class SimpleTest(unittest.TestCase):
                     if s["origin"] == "literal"}
         self.assertIn("SELECT * FROM ", literals)
         self.assertIn("SELECT name FROM %s WHERE id = %d", literals)
+
+    def test_bad_bitcode_fails(self):
+        proc = subprocess.run(
+            [self.EXTRACTOR, "--format", "json", "/tmp/missing-sql-test.bc"],
+            capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("cannot parse bitcode file(s)", proc.stderr)
+
+    def test_api_and_help(self):
+        bad = subprocess.run(
+            [self.EXTRACTOR, "--api", "foo:-1", self.BITCODE],
+            capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("invalid --api argument index", bad.stderr)
+        help_proc = subprocess.run([self.EXTRACTOR, "--help"],
+                                   capture_output=True, text=True)
+        self.assertEqual(help_proc.returncode, 0)
+        self.assertIn("--no-dispatch", help_proc.stderr)
+
+    def test_no_dispatch_skips_producer_inference(self):
+        doc = self.as_json("--no-dispatch")
+        self.assertFalse(any(s.get("line") == 112 and s["resolved"]
+                             for s in doc["statements"]),
+                         "--no-dispatch must not follow function returns")
+
+    def test_unique_recounts_dynamic_statements(self):
+        doc = self.as_json("--unique")
+        dynamic = [s for s in doc["statements"] if not s["resolved"]]
+        self.assertGreater(len(dynamic), 0)
+        rc, out, err = self.run_extractor("--format", "text", "--unique")
+        self.assertEqual(rc, 0, msg=err)
+        header = next(line for line in out.splitlines()
+                      if line.startswith("#statements"))
+        self.assertIn(" dynamic %d " % len(dynamic), header)
 
     def test_missing_input(self):
         proc = subprocess.run([self.EXTRACTOR, "--format", "json"],

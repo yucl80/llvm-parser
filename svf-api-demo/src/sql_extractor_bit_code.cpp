@@ -51,10 +51,11 @@
 #include "Util/Options.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -121,29 +122,6 @@ std::string stringConstantBytes(const llvm::Constant *C,
     return bytes;
 }
 
-bool looksLikeSql(const std::string &raw) {
-    const char *kw[] = {"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE",
-                        "DROP",   "ALTER",  "PRAGMA", "ATTACH", "DETACH",
-                        "BEGIN",  "COMMIT", "ROLLBACK", "REPLACE", "TRUNCATE",
-                        "GRANT",  "REVOKE", "WITH", "VACUUM", "ANALYZE",
-                        "EXPLAIN"};
-    size_t a = raw.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos)
-        return false;
-    size_t b = raw.find_last_not_of(" \t\r\n");
-    std::string s = raw.substr(a, b - a + 1);
-    size_t end = s.find_first_of(" \t\r\n(;");
-    std::string tok = end == std::string::npos ? s : s.substr(0, end);
-    if (tok.empty())
-        return false;
-    for (char &c : tok)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    for (const char *k : kw)
-        if (tok == k)
-            return true;
-    return false;
-}
-
 std::string functionSimpleName(llvm::StringRef mangled) {
     std::string dem = llvm::demangle(mangled.str());
     size_t lp = dem.find('(');
@@ -175,7 +153,7 @@ void resolveSql(const llvm::Value *V, const llvm::Module &M,
                 const llvm::DataLayout &DL, unsigned depth,
                 std::unordered_set<const llvm::Value *> &seen,
                 std::vector<ResolvedSql> &out,
-                const IndirectCallees &indirectCallees) {
+                const IndirectCallees &indirectCallees, bool allowDispatch) {
     if (!V || depth > 10)
         return;
     if (!seen.insert(V).second)
@@ -197,24 +175,30 @@ void resolveSql(const llvm::Value *V, const llvm::Module &M,
         if (const auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(ptr)) {
             if (GV->hasInitializer())
                 resolveSql(GV->getInitializer(), M, DL, depth + 1, seen, out,
-                           indirectCallees);
+                           indirectCallees, allowDispatch);
         }
         return;
     }
     if (const auto *PHI = llvm::dyn_cast<llvm::PHINode>(V)) {
+        if (!allowDispatch)
+            return;
         for (unsigned i = 0; i < PHI->getNumIncomingValues(); ++i)
             resolveSql(PHI->getIncomingValue(i), M, DL, depth + 1, seen, out,
-                       indirectCallees);
+                       indirectCallees, allowDispatch);
         return;
     }
     if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(V)) {
+        if (!allowDispatch)
+            return;
         resolveSql(Sel->getTrueValue(), M, DL, depth + 1, seen, out,
-                   indirectCallees);
+                   indirectCallees, allowDispatch);
         resolveSql(Sel->getFalseValue(), M, DL, depth + 1, seen, out,
-                   indirectCallees);
+                   indirectCallees, allowDispatch);
         return;
     }
     if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(V)) {
+        if (!allowDispatch)
+            return;
         // A direct call's return is followed interprocedurally; an indirect
         // call (virtual dispatch, a function pointer, a dispatch table,
         // std::function) is resolved through SVF's pointer analysis, which
@@ -233,7 +217,7 @@ void resolveSql(const llvm::Value *V, const llvm::Module &M,
                 for (const llvm::Instruction &I : BB)
                     if (const auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I))
                         resolveSql(RI->getReturnValue(), M, DL, depth + 1, seen,
-                                   out, indirectCallees);
+                                   out, indirectCallees, allowDispatch);
         return;
     }
     // LoadInst and every other runtime value: not statically known.
@@ -427,8 +411,11 @@ namespace sqlinfo {
 
 bool extractSqlFromBitcode(const SqlOptions &O, SqlReport &Report,
                           std::string &Error) {
+    Report = SqlReport{};
+    Error.clear();
     Report.apis = buildApis(O);
     std::unordered_set<std::string> consumed; // SQL text already reported
+    std::vector<std::string> Failed;
 
     for (const std::string &input : O.inputs) {
         Report.inputs.push_back(input);
@@ -437,12 +424,13 @@ bool extractSqlFromBitcode(const SqlOptions &O, SqlReport &Report,
         std::unique_ptr<llvm::Module> module =
             llvm::parseIRFile(input, diagnostic, context);
         if (!module) {
-            ++Report.parseErrors;
-            Error = input + ": " + diagnostic.getMessage().str();
+            Failed.push_back(input + ": " + diagnostic.getMessage().str());
             continue;
         }
         const llvm::DataLayout &DL = module->getDataLayout();
-        auto indirect = buildIndirectCallees(*module);
+        IndirectCallees indirect;
+        if (O.dispatch)
+            indirect = buildIndirectCallees(*module);
 
         for (const llvm::Function &F : *module) {
             if (F.isDeclaration() || F.isIntrinsic())
@@ -471,7 +459,8 @@ bool extractSqlFromBitcode(const SqlOptions &O, SqlReport &Report,
 
                     std::vector<ResolvedSql> sqls;
                     std::unordered_set<const llvm::Value *> seen;
-                    resolveSql(arg, *module, DL, 0, seen, sqls, indirect);
+                    resolveSql(arg, *module, DL, 0, seen, sqls, indirect,
+                               O.dispatch);
 
                     SqlStatement base;
                     fillLocation(base, I.getDebugLoc());
@@ -489,14 +478,17 @@ bool extractSqlFromBitcode(const SqlOptions &O, SqlReport &Report,
                     // The SQL may come from a single producer function or from
                     // several branches; the latter are alternatives, not one.
                     std::string producer;
-                    if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(arg)) {
-                        if (const llvm::Function *PF = CB->getCalledFunction())
+                    if (O.dispatch && llvm::dyn_cast<llvm::CallBase>(arg)) {
+                        const auto *ArgCall =
+                            llvm::cast<llvm::CallBase>(arg);
+                        if (const llvm::Function *PF =
+                                ArgCall->getCalledFunction())
                             producer = functionSimpleName(PF->getName());
                         else {
-                            // Indirect call (virtual dispatch, function pointer,
-                            // dispatch table, std::function) resolved by SVF:
-                            // name the producer from its (single) candidate.
-                            const auto it = indirect.find(CB);
+                            // Indirect call (virtual dispatch, function
+                            // pointer, dispatch table, std::function) resolved
+                            // by SVF: name the producer from its single target.
+                            const auto it = indirect.find(ArgCall);
                             if (it != indirect.end() && it->second.size() == 1)
                                 producer =
                                     functionSimpleName(it->second[0]->getName());
@@ -542,17 +534,32 @@ bool extractSqlFromBitcode(const SqlOptions &O, SqlReport &Report,
                 st.sql = text;
                 st.resolved = true;
                 st.complete = true;
+                llvm::DebugLoc LiteralLoc;
+                for (const llvm::Use &U : GV.uses())
+                    if (const auto *Inst = llvm::dyn_cast<llvm::Instruction>(
+                            U.getUser())) {
+                        if (Inst->getDebugLoc()) {
+                            LiteralLoc = Inst->getDebugLoc();
+                            break;
+                        }
+                    }
+                fillLocation(st, LiteralLoc);
                 Report.statements.push_back(std::move(st));
             }
     }
 
-    if (O.unique) {
-        std::vector<SqlStatement> filtered;
-        std::unordered_set<std::string> seenText;
-        for (SqlStatement &st : Report.statements)
-            if (seenText.insert(st.sql).second)
-                filtered.push_back(std::move(st));
-        Report.statements = std::move(filtered);
+    if (O.unique)
+        dedupSqlStatements(Report);
+
+    Report.parseErrors = Failed.size();
+    if (!Failed.empty()) {
+        Error = "cannot parse bitcode file(s): ";
+        for (size_t I = 0; I < Failed.size(); ++I) {
+            if (I)
+                Error += ", ";
+            Error += Failed[I];
+        }
+        return false;
     }
     return true;
 }
@@ -566,6 +573,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[ERROR] %s\n", Error.c_str());
         printSqlUsage(argv[0]);
         return 1;
+    }
+    if (Options.help) {
+        printSqlUsage(argv[0]);
+        return 0;
     }
 
     SqlReport Report;
@@ -584,8 +595,8 @@ int main(int argc, char **argv) {
             ++Resolved;
     std::fprintf(stderr,
                  "[sql_bitcode_extractor] files=%zu statements=%zu resolved=%zu "
-                 "dynamic=%zu\n",
+                 "dynamic=%zu parse_errors=%zu\n",
                  Report.inputs.size(), Report.statements.size(), Resolved,
-                 Report.unresolved);
+                 Report.unresolved, Report.parseErrors);
     return 0;
 }

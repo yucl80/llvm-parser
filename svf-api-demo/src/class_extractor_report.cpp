@@ -34,24 +34,58 @@ std::string lowerAscii(std::string s) {
     return s;
 }
 
+/// Length of a valid UTF-8 sequence at \p s, or 0 if the bytes are invalid.
+int utf8SeqLength(const unsigned char* s, size_t n) {
+    if (n == 0) return 0;
+    const unsigned char c = s[0];
+    int extra = 0;
+    if (c >= 0xC2 && c <= 0xDF) extra = 1;
+    else if (c >= 0xE0 && c <= 0xEF) extra = 2;
+    else if (c >= 0xF0 && c <= 0xF4) extra = 3;
+    else return 0;
+    if (n < static_cast<size_t>(extra + 1)) return 0;
+    for (int i = 1; i <= extra; ++i)
+        if ((s[i] & 0xC0) != 0x80) return 0;
+    // Reject overlong encodings, surrogates and code points above U+10FFFF.
+    if (extra == 2 && c == 0xE0 && s[1] < 0xA0) return 0;
+    if (extra == 2 && c == 0xED && s[1] > 0x9F) return 0;
+    if (extra == 3 && c == 0xF0 && s[1] < 0x90) return 0;
+    if (extra == 3 && c == 0xF4 && s[1] > 0x8F) return 0;
+    return extra + 1;
+}
+
 std::string jsonEscape(const std::string& in) {
     std::string out;
     out.reserve(in.size() + 8);
-    for (const char c : in) {
+    for (size_t i = 0; i < in.size();) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
         switch (c) {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
+        case '"': out += "\\\""; ++i; break;
+        case '\\': out += "\\\\"; ++i; break;
+        case '\n': out += "\\n"; ++i; break;
+        case '\r': out += "\\r"; ++i; break;
+        case '\t': out += "\\t"; ++i; break;
         default:
-            if (static_cast<unsigned char>(c) < 0x20) {
+            if (c < 0x20) {
                 char buf[8];
                 std::snprintf(buf, sizeof(buf), "\\u%04x",
                               static_cast<unsigned>(c));
                 out += buf;
+                ++i;
+            } else if (c < 0x80) {
+                out += static_cast<char>(c);
+                ++i;
             } else {
-                out += c;
+                const int len = utf8SeqLength(
+                    reinterpret_cast<const unsigned char*>(in.data()) + i,
+                    in.size() - i);
+                if (len > 0) {
+                    out.append(in, i, static_cast<size_t>(len));
+                    i += static_cast<size_t>(len);
+                } else {
+                    out += "\\uFFFD";
+                    ++i;
+                }
             }
         }
     }
@@ -209,7 +243,10 @@ void writeJsonReport(std::string& out, const ClassReport& report) {
     out += extractorName(report.inputType);
     out += "\",\n";
     out += "  \"debug_info\": ";
-    out += boolText(report.hasDebugInfo);
+    // Source input has no DWARF concept; "true" there would be misleading.
+    out += report.inputType == InputType::Bitcode
+               ? boolText(report.hasDebugInfo)
+               : "null";
     out += ",\n";
     out += "  \"hidden_library_classes\": " +
            std::to_string(report.hiddenClasses) + ",\n";
@@ -260,6 +297,7 @@ void writeJsonReport(std::string& out, const ClassReport& report) {
             out += (i == 0 ? "\n" : ",\n");
             out += "        {\"name\": \"" + jsonEscape(method.name) +
                    "\", \"signature\": \"" + jsonEscape(method.signature) +
+                   "\", \"params\": \"" + jsonEscape(method.params) +
                    "\", \"linkage_name\": \"" +
                    jsonEscape(method.linkageName) + "\", \"access\": \"" +
                    jsonEscape(method.access) + "\", \"virtual\": ";
@@ -333,16 +371,33 @@ InputType detectInputType(const std::string& path) {
         return InputType::Bitcode;
 
     const std::string text(head, static_cast<size_t>(size));
-    const std::string firstLine = text.substr(0, text.find('\n'));
-    if (firstLine.find("ModuleID") != std::string::npos ||
-        firstLine.find("target datalayout") != std::string::npos ||
-        firstLine.find("target triple") != std::string::npos)
-        return InputType::Bitcode;
-
-    for (const unsigned char c : text) {
-        if (c != '\n' && c != '\r' && c != '\t' &&
-            (c < 0x20 || c > 0x7e))
-            return InputType::Unknown;
+    // Textual IR markers may follow comments or blank lines; scan the first
+    // several lines instead of relying on line 1 alone.
+    {
+        size_t pos = 0;
+        for (int line = 0; line < 8 && pos < text.size(); ++line) {
+            const size_t end = text.find('\n', pos);
+            const std::string l = text.substr(
+                pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (l.find("ModuleID") != std::string::npos ||
+                l.find("target datalayout") != std::string::npos ||
+                l.find("target triple") != std::string::npos)
+                return InputType::Bitcode;
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+    }
+    const unsigned char* bytes =
+        reinterpret_cast<const unsigned char*>(text.data());
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = bytes[i];
+        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c <= 0x7e)) {
+            ++i;
+            continue;
+        }
+        const int len = utf8SeqLength(bytes + i, text.size() - i);
+        if (len == 0) return InputType::Unknown;
+        i += static_cast<size_t>(len);
     }
     return InputType::Source;
 }

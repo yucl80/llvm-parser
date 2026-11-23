@@ -18,6 +18,8 @@ Drives the built binary against the repository fixture
   * json / text / sql layouts and --output;
   * --api (including qualified names and overriding a built-in index),
     --no-builtin, --unique;
+  * plain assignment, corrected C/C++ escapes, multiple-return alternatives,
+    dynamic-statement counting under --unique and trailing SQL comments;
   * clang argument pass-through ("-- -D..."), multiple inputs, CLI errors.
 
 Run through CTest (see CMakeLists.txt) or directly:
@@ -63,6 +65,30 @@ void cond(sqlite3* db) {
   sqlite3_exec(db, "PRAGMA special_setting = 1", 0, 0, 0);
 #endif
 }
+"""
+
+FIXED_BUGS_FIXTURE = """\
+typedef struct sqlite3 sqlite3;
+extern "C" int sqlite3_exec(sqlite3*, const char*, void*, void*, char**);
+void assigned(sqlite3* db) {
+  const char* sql = "SELECT 0";
+  sql = "SELECT 1 FROM t";
+  sqlite3_exec(db, sql, 0, 0, 0);
+}
+void escapes(sqlite3* db) {
+  sqlite3_exec(db, "SELECT '\\012' AS nl, '\\x00000041\\x00000042' AS ab, "
+                   "'\\u00e9' AS e", 0, 0, 0);
+}
+const char* choose(bool b) {
+  if (b) return "SELECT 2 FROM t";
+  return "SELECT 3 FROM t";
+}
+void multi(sqlite3* db) { sqlite3_exec(db, choose(true), 0, 0, 0); }
+void dynamic(sqlite3* db, const char* p) {
+  sqlite3_exec(db, p, 0, 0, 0);
+  sqlite3_exec(db, p, 0, 0, 0);
+}
+void tail(sqlite3* db) { sqlite3_exec(db, "SELECT 4 -- trailing", 0, 0, 0); }
 """
 
 
@@ -314,6 +340,50 @@ def main():
                     "clang args after -- must reach the parser")
         doc = as_json(extractor, fixture, str(cond), "--", "-DUSE_SPECIAL")
         suite.check(len(doc["inputs"]) == 2, "multiple inputs not reported")
+
+        suite.section("fixed static-evaluation bugs")
+        fixed = work / "fixed.cpp"
+        fixed.write_text(FIXED_BUGS_FIXTURE)
+        doc = as_json(extractor, str(fixed))
+        sqls = [s["sql"] for s in doc["statements"] if s["resolved"]]
+        suite.check("SELECT 1 FROM t" in sqls and "SELECT 0" not in sqls,
+                    "plain assignment should replace the initial value")
+        suite.check(any("AB" in s and "\u00e9" in s for s in sqls),
+                    "\\xNN and \\uNNNN escapes should be decoded")
+        suite.check(any("\n" in s for s in sqls),
+                    "\\012 should decode as newline, not NUL + digits")
+        variants = [s for s in doc["statements"]
+                    if "SELECT 2 FROM t" in s["sql"] or
+                    "SELECT 3 FROM t" in s["sql"]]
+        suite.check(len(variants) == 2 and
+                    all(not s["complete"] for s in variants),
+                    "multiple return literals must be marked partial")
+        uniq = as_json(extractor, "--unique", str(fixed))
+        dynamic_calls = [s for s in uniq["statements"] if not s["resolved"]]
+        suite.check(len(dynamic_calls) == 2,
+                    "--unique must not collapse distinct dynamic calls")
+        uniq_text = run(extractor, "--format", "text", "--unique",
+                        str(fixed)).stdout
+        header = next(line for line in uniq_text.splitlines()
+                      if line.startswith("#statements"))
+        suite.check(" dynamic 2 " in header,
+                    "--unique must recount dynamic calls in the report")
+        script = run(extractor, "--format", "sql", str(fixed)).stdout
+        suite.check("SELECT 4 -- trailing\n;" in script,
+                    "SQL script must put the semicolon after a trailing comment")
+
+        suite.section("fixed CLI parsing bugs")
+        for bad in ("foo:-1", "name:", "--no-builtin"):
+            proc = run(extractor, "--api", bad, fixture, ok=False)
+            suite.check(proc.returncode != 0,
+                        "--api '%s' should be rejected" % bad)
+        help_proc = run(extractor, "--help")
+        suite.check(help_proc.returncode == 0 and
+                    "--include-headers" in help_proc.stderr and
+                    "--no-dispatch" in help_proc.stderr,
+                    "--help should document all accepted options")
+        suite.check(run(extractor, "--include-headers", fixture).returncode == 0,
+                    "--include-headers should be accepted by the CLI")
 
         suite.section("cli errors")
         missing = run(extractor, str(work / "missing.cpp"), ok=False)

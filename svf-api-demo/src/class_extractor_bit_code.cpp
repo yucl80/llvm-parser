@@ -528,12 +528,15 @@ private:
 
     static bool sameMethod(const MethodInfo& a, const MethodInfo& b) {
         if (a.name != b.name || a.params != b.params) return false;
+        if (a.isStatic != b.isStatic) return false;
         // The D0/D1/D2 (constructor C1/C2) variants of a destructor share one
         // source-level function; their mangled names differ.
-        const bool destructor = !a.name.empty() && a.name[0] == '~';
-        if (!a.linkageName.empty() && !b.linkageName.empty() && !destructor)
+        if (!a.name.empty() && a.name[0] == '~') return true;
+        if (!a.linkageName.empty() && !b.linkageName.empty())
             return a.linkageName == b.linkageName;
-        return true;
+        // No mangled names: fall back to the full signature so that f() and
+        // f() const (whose DWARF parameter lists are identical) stay distinct.
+        return a.signature == b.signature;
     }
 
     static void mergeMethod(MethodInfo& dst, const MethodInfo& src) {

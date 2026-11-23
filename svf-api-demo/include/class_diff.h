@@ -65,6 +65,8 @@ struct Options {
     bool exitCode = false;
     bool useCompilationDB = true;
     bool includeLibrary = false;  ///< bitcode: keep library classes
+    bool standardSpecified = false;
+    bool allowParseErrors = false;  ///< continue even when parsing failed
 };
 
 enum class Change { Added, Removed, Modified, Unchanged };
@@ -81,6 +83,7 @@ struct ClassDiff {
     Change change = Change::Unchanged;
     std::string name;
     std::vector<std::string> classReasons;
+    std::vector<std::string> classDetails;
     std::vector<MethodDiff> methods;
 };
 
@@ -125,7 +128,8 @@ void buildSnapshot(Snapshot& S, const Options& O,
 void buildBitcodeSnapshot(Snapshot& S, const Options& O);  // class_diff_bitcode.cpp
 
 //--- CLI (class_diff.cpp) ---------------------------------------------------
-bool parseArgs(int argc, char** argv, Options& O, std::string& Error);
-void printUsage(const char* Prog);
+enum class ParseResult { Ok, Help, Error };
+ParseResult parseArgs(int argc, char** argv, Options& O, std::string& Error);
+void printUsage(const char* Prog, FILE* Out = stderr);
 
 }  // namespace classdiff

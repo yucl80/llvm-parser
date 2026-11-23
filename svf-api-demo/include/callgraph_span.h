@@ -31,6 +31,10 @@ struct FuncInfo {
     bool isStd = false;     ///< library code: hidden from output when excludeStd is on
     bool filtered = false;  ///< matches a --filter-file pattern: hidden from output
     bool isApp = false;     ///< defined in the application's own source tree
+
+    /// Dense ID of the interned mangled name, so a function is counted once
+    /// per entry by name (not by FunObjVar) without hashing strings per span.
+    unsigned reachId = 0;
 };
 
 #endif // CALLGRAPH_SPAN_H

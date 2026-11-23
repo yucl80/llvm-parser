@@ -25,9 +25,9 @@
 
 namespace classdiff {
 
-void printUsage(const char* Prog) {
+void printUsage(const char* Prog, FILE* Out) {
     std::fprintf(
-        stderr,
+        Out,
         "Usage: %s [options] <old-project> <new-project> [-- <clang args>]\n"
         "\n"
         "Compare two C/C++ projects and print the classes that changed together\n"
@@ -53,6 +53,7 @@ void printUsage(const char* Prog) {
         "  --lib-prefix <ns>      Bitcode: extra library prefix (repeatable)\n"
         "  --exit-code            Return 1 when differences were found\n"
         "  --no-compilation-db    Source: ignore compile_commands.json\n"
+        "  --allow-parse-errors   Continue even if a source/module failed to parse\n"
         "  -- <clang args>        Source: extra arguments (-I, -D, ...) for both\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -65,7 +66,7 @@ void printUsage(const char* Prog) {
         Prog);
 }
 
-bool parseArgs(int argc, char** argv, Options& O, std::string& Error) {
+ParseResult parseArgs(int argc, char** argv, Options& O, std::string& Error) {
     bool afterDashDash = false;
     for (int I = 1; I < argc; ++I) {
         const std::string A = argv[I];
@@ -76,31 +77,32 @@ bool parseArgs(int argc, char** argv, Options& O, std::string& Error) {
         if (A == "--") {
             afterDashDash = true;
         } else if (A == "-h" || A == "--help") {
-            printUsage(argv[0]);
-            std::exit(0);
+            printUsage(argv[0], stdout);
+            return ParseResult::Help;
         } else if (A == "--format" || A == "--output" || A == "--std" ||
                    A == "--ignore" || A == "--input-type" ||
                    A == "--lib-prefix") {
             if (I + 1 >= argc) {
                 Error = "missing value for " + A;
-                return false;
+                return ParseResult::Error;
             }
             const std::string V = argv[++I];
             if (A == "--format") {
                 if (V != "text" && V != "json") {
                     Error = "unknown --format '" + V + "' (expected text or json)";
-                    return false;
+                    return ParseResult::Error;
                 }
                 O.format = V;
             } else if (A == "--output") {
                 O.output = V;
             } else if (A == "--std") {
                 O.standard = V;
+                O.standardSpecified = true;
             } else if (A == "--input-type") {
                 if (V != "auto" && V != "source" && V != "bitcode") {
                     Error = "unknown --input-type '" + V +
                             "' (expected auto, source or bitcode)";
-                    return false;
+                    return ParseResult::Error;
                 }
                 O.inputType = V;
             } else if (A == "--lib-prefix") {
@@ -116,18 +118,20 @@ bool parseArgs(int argc, char** argv, Options& O, std::string& Error) {
             O.exitCode = true;
         } else if (A == "--no-compilation-db") {
             O.useCompilationDB = false;
+        } else if (A == "--allow-parse-errors") {
+            O.allowParseErrors = true;
         } else if (startsWith(A, "--")) {
             Error = "unknown option: " + A;
-            return false;
+            return ParseResult::Error;
         } else {
             O.roots.push_back(A);
         }
     }
     if (O.roots.size() != 2) {
         Error = "expected exactly two project paths (old and new)";
-        return false;
+        return ParseResult::Error;
     }
-    return true;
+    return ParseResult::Ok;
 }
 
 }  // namespace classdiff
@@ -135,26 +139,35 @@ bool parseArgs(int argc, char** argv, Options& O, std::string& Error) {
 int main(int argc, char** argv) {
     classdiff::Options O;
     std::string Error;
-    if (!classdiff::parseArgs(argc, argv, O, Error)) {
+    const classdiff::ParseResult Parsed =
+        classdiff::parseArgs(argc, argv, O, Error);
+    if (Parsed == classdiff::ParseResult::Help)
+        return 0;
+    if (Parsed == classdiff::ParseResult::Error) {
         std::fprintf(stderr, "[ERROR] %s\n", Error.c_str());
-        classdiff::printUsage(argv[0]);
+        classdiff::printUsage(argv[0], stderr);
         return 1;
     }
 
     classdiff::Snapshot Old, New;
-    if (!classdiff::initProject(O.roots[0], O, Old, Error) ||
-        !classdiff::initProject(O.roots[1], O, New, Error)) {
-        std::fprintf(stderr, "[ERROR] %s\n", Error.c_str());
+    std::string OldError, NewError;
+    const bool OldOk = classdiff::initProject(O.roots[0], O, Old, OldError);
+    const bool NewOk = classdiff::initProject(O.roots[1], O, New, NewError);
+    if (!OldOk || !NewOk) {
+        if (!OldOk)
+            std::fprintf(stderr, "[ERROR] old project: %s\n", OldError.c_str());
+        if (!NewOk)
+            std::fprintf(stderr, "[ERROR] new project: %s\n", NewError.c_str());
         return 1;
     }
+
     classdiff::Backend B = classdiff::Backend::Source;
     if (!classdiff::detectBackend(O, Old, New, B, Error)) {
         std::fprintf(stderr, "[ERROR] %s\n", Error.c_str());
         return 1;
     }
     if (B == classdiff::Backend::Bitcode) {
-        if (!O.clangArgs.empty() || O.standard != "c++17" ||
-            !O.useCompilationDB)
+        if (!O.clangArgs.empty() || O.standardSpecified || !O.useCompilationDB)
             std::fprintf(stderr,
                          "[WARN] --std, --no-compilation-db and -- <clang args> "
                          "only apply to source inputs; ignored\n");
@@ -163,14 +176,28 @@ int main(int argc, char** argv) {
                      "[WARN] --include-library and --lib-prefix only apply to "
                      "bitcode inputs; ignored\n");
     }
+    const size_t IgnoredFiles =
+        B == classdiff::Backend::Bitcode
+            ? Old.sources.size() + New.sources.size()
+            : Old.bitcodes.size() + New.bitcodes.size();
+    if (IgnoredFiles)
+        std::fprintf(stderr,
+                     "[WARN] --input-type %s: ignoring %zu %s input files\n",
+                     classdiff::backendName(B), IgnoredFiles,
+                     B == classdiff::Backend::Bitcode ? "source" : "bitcode");
 
     if (B == classdiff::Backend::Bitcode) {
         classdiff::buildBitcodeSnapshot(Old, O);
         classdiff::buildBitcodeSnapshot(New, O);
-        if (Old.hasDebugInfo != New.hasDebugInfo)
+        if (Old.hasDebugInfo != New.hasDebugInfo) {
             std::fprintf(stderr,
-                         "[WARN] only one project carries DWARF debug info; "
-                         "both .bc sets should be built with the same flags\n");
+                         "[ERROR] DWARF debug info differs between the two "
+                         "projects (old=%s, new=%s); build both with the same "
+                         "-g flags\n",
+                         Old.hasDebugInfo ? "yes" : "no",
+                         New.hasDebugInfo ? "yes" : "no");
+            return 1;
+        }
     } else {
         const std::string ResourceDir = classdiff::detectResourceDir();
         const std::string ResourceArg =
@@ -180,6 +207,23 @@ int main(int argc, char** argv) {
                 : "-resource-dir=" + ResourceDir;
         classdiff::buildSnapshot(Old, O, ResourceArg);
         classdiff::buildSnapshot(New, O, ResourceArg);
+    }
+
+    const size_t ParseErrors = Old.parseErrors + New.parseErrors;
+    if (ParseErrors && !O.allowParseErrors) {
+        std::fprintf(stderr,
+                     "[ERROR] %zu input file(s) failed to parse; use "
+                     "--allow-parse-errors to continue anyway\n",
+                     ParseErrors);
+        return 1;
+    }
+    if (Old.classes.empty() || New.classes.empty()) {
+        std::fprintf(stderr,
+                     "[ERROR] no classes found in the %s snapshot(s) "
+                     "(old=%zu, new=%zu)\n",
+                     classdiff::backendName(B), Old.classes.size(),
+                     New.classes.size());
+        return 1;
     }
 
     const std::vector<classdiff::ClassDiff> Diffs =
@@ -198,8 +242,11 @@ int main(int argc, char** argv) {
         classdiff::writeJson(Out, Old, New, Diffs, B);
     else
         classdiff::writeText(Out, Old, New, Diffs, B);
-    if (Out != stdout)
-        std::fclose(Out);
+    bool WriteFailed = false;
+    if (std::fflush(Out) != 0 || std::ferror(Out))
+        WriteFailed = true;
+    if (Out != stdout && std::fclose(Out) != 0)
+        WriteFailed = true;
 
     size_t ChangedMethods = 0;
     for (const classdiff::ClassDiff& C : Diffs)
@@ -212,7 +259,10 @@ int main(int argc, char** argv) {
                  "changed_methods=%zu parse_errors=%zu\n",
                  classdiff::backendName(B), classdiff::fileCount(Old, B),
                  Old.classes.size(), classdiff::fileCount(New, B),
-                 New.classes.size(), Diffs.size(), ChangedMethods,
-                 Old.parseErrors + New.parseErrors);
+                 New.classes.size(), Diffs.size(), ChangedMethods, ParseErrors);
+    if (WriteFailed) {
+        std::fprintf(stderr, "[ERROR] failed to write report\n");
+        return 1;
+    }
     return O.exitCode && !Diffs.empty() ? 1 : 0;
 }

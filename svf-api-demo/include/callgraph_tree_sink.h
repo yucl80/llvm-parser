@@ -20,6 +20,7 @@ struct SpanRecord {
     bool indirect = false;
     unsigned depth = 0;
     bool cycle = false;
+    bool isLast = false;  ///< filled by renderAll: last child of its parent
     const CallSiteLoc* callLoc = nullptr;
 };
 
@@ -48,14 +49,10 @@ public:
 private:
     static constexpr size_t kNoSpan = std::numeric_limits<size_t>::max();
 
-    void renderNode(size_t idx, const std::string& prefix, bool last,
-                    bool hasParent);
+    void renderAll();
 
     std::ostream& os_;
     std::vector<SpanRecord> spans_;
-    std::vector<size_t> firstChild_;
-    std::vector<size_t> lastChild_;
-    std::vector<size_t> nextSibling_;
 };
 
 #endif // CALLGRAPH_TREE_SINK_H

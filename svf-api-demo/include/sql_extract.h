@@ -62,15 +62,29 @@ struct SqlOptions {
     /// and report unresolvable arguments strictly as dynamic.
     bool dispatch = true;
     std::vector<std::string> clangArgs; ///< source backend, after "--"
+    bool help = false;                  ///< --help was requested
 };
 
 /// Built-in SQLite C API entry points (SQL is argument 1: db, sql, ...).
 std::vector<ApiSpec> builtinSqliteApis();
 
-/// Parse each input with libclang and collect SQL statements. Returns false
-/// when a translation unit cannot be parsed at all, and sets \p error.
+/// Parse each input with libclang and collect SQL statements. \p report and
+/// \p error are reset on entry. Returns false when any translation unit cannot
+/// be parsed at all; the report may still contain results from the inputs that
+/// were parsed successfully.
 bool extractSqlFromSource(const SqlOptions& options, SqlReport& report,
                           std::string& error);
+
+/// Parse each input as LLVM bitcode/IR with the LLVM reader. \p report and
+/// \p error are reset on entry. Returns false when any input cannot be parsed.
+bool extractSqlFromBitcode(const SqlOptions& options, SqlReport& report,
+                           std::string& error);
+
+/// Canonical SQL-literal heuristic used by both backends' --scan-literals.
+bool looksLikeSql(const std::string& text);
+
+/// Deduplicate statements according to --unique and recompute unresolved.
+void dedupSqlStatements(SqlReport& report);
 
 /// Render \p report in the requested format to stdout or options.output.
 bool writeSqlReport(const SqlReport& report, const SqlOptions& options,

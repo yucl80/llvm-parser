@@ -238,10 +238,9 @@ std::string methodSignature(CXCursor M, CXCursorKind Kind) {
     CXCursor Arg = clang_Cursor_getArgument(M, static_cast<unsigned>(I));
     if (I)
       S += ", ";
+    // The DWARF backend emits parameter types only. Emitting argument names
+    // here would break the shared signature shape ("void speak(int) const").
     S += toStd(clang_getTypeSpelling(clang_getCursorType(Arg)));
-    std::string ArgName = toStd(clang_getCursorSpelling(Arg));
-    if (!ArgName.empty())
-      S += " " + ArgName;
   }
   if (clang_Cursor_isVariadic(M))
     S += NumArgs > 0 ? ", ..." : "...";
@@ -280,6 +279,11 @@ private:
     std::vector<CXCursor> Nested;
   };
 
+  struct SeenEntry {
+    std::string Key;
+    bool IsDefinition;
+  };
+
   bool inScope(CXCursor C) const {
     CXSourceLocation Loc = clang_getCursorLocation(C);
     if (clang_Location_isInSystemHeader(Loc))
@@ -287,14 +291,12 @@ private:
     return AllHeaders || clang_Location_isFromMainFile(Loc);
   }
 
-  static bool alreadySeen(Collector &Self, CXCursor C) {
+  /// Stable key for a class declaration across translation units.
+  static std::string classKey(CXCursor C) {
     std::string Key = toStd(clang_getCursorUSR(C));
     if (Key.empty())
       Key = locationStr(C) + ":" + toStd(clang_getCursorSpelling(C));
-    if (std::find(Self.Seen.begin(), Self.Seen.end(), Key) != Self.Seen.end())
-      return true;
-    Self.Seen.push_back(Key);
-    return false;
+    return Key;
   }
 
   static CXChildVisitResult topLevelVisitor(CXCursor C, CXCursor,
@@ -327,6 +329,22 @@ private:
       B.access = accessStr(clang_getCXXAccessSpecifier(C));
       B.isVirtual = clang_isVirtualBase(C) != 0;
       Ctx->Info->bases.push_back(std::move(B));
+      return CXChildVisit_Continue;
+    }
+
+    // Instance fields are FieldDecl; static data members are VarDecl.
+    // Offsets are DWARF-only, so they stay at zero here.
+    if (K == CXCursor_FieldDecl || K == CXCursor_VarDecl) {
+      if (!Self->inScope(C))
+        return CXChildVisit_Continue;
+      FieldInfo FI;
+      FI.name = toStd(clang_getCursorSpelling(C));
+      if (FI.name.empty())
+        FI.name = "<anonymous>";
+      FI.type = toStd(clang_getTypeSpelling(clang_getCursorType(C)));
+      FI.access = accessStr(clang_getCXXAccessSpecifier(C));
+      FI.isStatic = K == CXCursor_VarDecl;
+      Ctx->Info->fields.push_back(std::move(FI));
       return CXChildVisit_Continue;
     }
 
@@ -403,15 +421,30 @@ private:
   void handleClass(CXCursor C) {
     if (clang_Cursor_isNull(C) || !inScope(C))
       return;
-    if (alreadySeen(*this, C))
-      return;
+
+    const bool IsDefinition = clang_isCursorDefinition(C) != 0;
+    const std::string Key = classKey(C);
+    auto It = std::find_if(Seen.begin(), Seen.end(),
+                           [&](const SeenEntry &E) { return E.Key == Key; });
+    if (It != Seen.end()) {
+      // A definition supersedes an earlier forward declaration: remove the
+      // partial entry so members and fields are collected from the definition.
+      if (!IsDefinition || It->IsDefinition)
+        return;
+      const size_t Index = static_cast<size_t>(It - Seen.begin());
+      if (Index < Classes.size())
+        Classes.erase(Classes.begin() +
+                      static_cast<std::vector<ClassInfo>::difference_type>(Index));
+      Seen.erase(It);
+    }
+    Seen.push_back({Key, IsDefinition});
 
     ClassInfo Info;
     Info.name = scopePrefix(C) + toStd(clang_getCursorDisplayName(C));
     if (Info.name.empty())
       Info.name = "(anonymous)";
     splitLocation(locationStr(C), Info.file, Info.line);
-    Info.hasDefinition = clang_isCursorDefinition(C) != 0;
+    Info.hasDefinition = IsDefinition;
 
     switch (clang_getCursorKind(C)) {
     case CXCursor_StructDecl:
@@ -442,7 +475,8 @@ private:
   }
 
   bool AllHeaders;
-  std::vector<std::string> Seen;
+  // Index-aligned with Classes so an upgrade can erase the stale entry.
+  std::vector<SeenEntry> Seen;
 };
 
 //===----------------------------------------------------------------------===//
@@ -540,6 +574,7 @@ CXTranslationUnit parse(const std::string &Path, bool IsC,
     return nullptr;
   }
 
+  bool HasError = false;
   unsigned NumDiags = clang_getNumDiagnostics(TU);
   for (unsigned I = 0; I < NumDiags; ++I) {
     CXDiagnostic Diag = clang_getDiagnostic(TU, I);
@@ -548,8 +583,13 @@ CXTranslationUnit parse(const std::string &Path, bool IsC,
           Diag, clang_defaultDiagnosticDisplayOptions());
       std::fprintf(stderr, "%s\n", clang_getCString(Text));
       clang_disposeString(Text);
+      HasError = true;
     }
     clang_disposeDiagnostic(Diag);
+  }
+  if (HasError) {
+    clang_disposeTranslationUnit(TU);
+    return nullptr;
   }
   return TU;
 }
@@ -567,11 +607,22 @@ bool extractClassesFromSource(const ClassOptions &options, ClassReport &report,
     std::string Ext = extensionOf(Src);
     bool IsC = Ext == ".c";
     bool IsHeader = isCFamilyHeader(Ext);
-    // A .h file is treated as C only when the user says so with -x c.
-    bool HeaderAsC = IsHeader && hasArg(options.clangArgs, "-x") &&
-                     std::find(options.clangArgs.begin(),
-                               options.clangArgs.end(), "c") !=
-                         options.clangArgs.end();
+    // A .h file is treated as C only when the user says so with -x c
+    // (both "-x c" and "-xc" spellings are accepted).
+    bool HeaderAsC = false;
+    for (size_t I = 0; I < options.clangArgs.size(); ++I) {
+      const std::string &A = options.clangArgs[I];
+      std::string Lang;
+      if (A == "-x" && I + 1 < options.clangArgs.size())
+        Lang = options.clangArgs[I + 1];
+      else if (A.size() > 2 && A.compare(0, 2, "-x") == 0)
+        Lang = A.substr(2);
+      if (Lang == "c" || Lang == "c-header") {
+        HeaderAsC = true;
+        break;
+      }
+    }
+    HeaderAsC = IsHeader && HeaderAsC;
 
     CXTranslationUnit TU = parse(Src, IsC || HeaderAsC, options.clangArgs);
     if (!TU) {

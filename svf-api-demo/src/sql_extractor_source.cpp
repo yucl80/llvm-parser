@@ -161,6 +161,8 @@ CXCursor findFunctionRef(CXCursor C, int Depth) {
 //===----------------------------------------------------------------------===//
 
 void appendUtf8(std::string &Out, unsigned CodePoint) {
+    if (CodePoint > 0x10ffff || (CodePoint >= 0xd800 && CodePoint <= 0xdfff))
+        CodePoint = 0xfffd; // replacement character for invalid scalar values
     if (CodePoint <= 0x7f) {
         Out += static_cast<char>(CodePoint);
     } else if (CodePoint <= 0x7ff) {
@@ -188,6 +190,12 @@ int hexDigit(char C) {
     return -1;
 }
 
+void truncateAtNul(std::string &Text) {
+    const size_t Nul = Text.find('\0');
+    if (Nul != std::string::npos)
+        Text.resize(Nul);
+}
+
 /// libclang renders a StringLiteral spelling as a quoted, C-escaped string
 /// (also for raw strings and adjacent literal concatenations). Decode it back
 /// to the exact bytes that reach sqlite3 at runtime.
@@ -206,6 +214,7 @@ bool decodeLiteral(const std::string &Spelling, std::string &Out) {
             const size_t End = Spelling.find(Close, Open + 1);
             if (End != std::string::npos) {
                 Out = Spelling.substr(Open + 1, End - Open - 1);
+                truncateAtNul(Out);
                 return true;
             }
         }
@@ -219,15 +228,29 @@ bool decodeLiteral(const std::string &Spelling, std::string &Out) {
     if (I >= N || Spelling[I] != '"') {
         // Already the bare contents (older libclang versions).
         Out = Spelling;
+        truncateAtNul(Out);
         return true;
     }
     ++I;
+
+    const auto readHex = [&](size_t &Pos, int MaxDigits, unsigned &Value) {
+        Value = 0;
+        int Digits = 0;
+        while (Pos < N && Digits < MaxDigits && hexDigit(Spelling[Pos]) >= 0) {
+            if (Value <= 0x00ffffffu)
+                Value = Value * 16 + static_cast<unsigned>(hexDigit(Spelling[Pos]));
+            ++Pos;
+            ++Digits;
+        }
+        return Digits;
+    };
 
     std::string Result;
     while (I < N) {
         const char C = Spelling[I++];
         if (C == '"') {
-            Out = Result;
+            truncateAtNul(Result);
+            Out = std::move(Result);
             return true;
         }
         if (C != '\\') {
@@ -245,30 +268,41 @@ bool decodeLiteral(const std::string &Spelling, std::string &Out) {
         case 'b': Result += '\b'; break;
         case 'f': Result += '\f'; break;
         case 'v': Result += '\v'; break;
-        case '0': Result += '\0'; break;
         case '\\': Result += '\\'; break;
         case '\'': Result += '\''; break;
         case '"': Result += '"'; break;
         case '?': Result += '?'; break;
         case 'x': {
             unsigned Value = 0;
-            int Digits = 0;
-            while (I < N && Digits < 2 && hexDigit(Spelling[I]) >= 0) {
-                Value = Value * 16 + static_cast<unsigned>(hexDigit(Spelling[I]));
-                ++I;
-                ++Digits;
-            }
+            readHex(I, static_cast<int>(N), Value);
             Result += static_cast<char>(Value & 0xff);
             break;
         }
         case 'u':
         case 'U': {
-            const int Want = E == 'u' ? 4 : 8;
             unsigned Value = 0;
-            int Digits = 0;
-            while (I < N && Digits < Want && hexDigit(Spelling[I]) >= 0) {
-                Value = Value * 16 + static_cast<unsigned>(hexDigit(Spelling[I++]));
-                ++Digits;
+            const int Want = E == 'u' ? 4 : 8;
+            if (readHex(I, Want, Value) == 0) {
+                appendUtf8(Result, 0xfffd);
+                break;
+            }
+            if (E == 'u') {
+                if (Value >= 0xd800 && Value <= 0xdbff) {
+                    unsigned Low = 0;
+                    size_t Pair = I;
+                    if (I + 5 < N && Spelling[I] == '\\' &&
+                        Spelling[I + 1] == 'u' &&
+                        readHex(Pair = I + 2, 4, Low) == 4 &&
+                        Low >= 0xdc00 && Low <= 0xdfff) {
+                        Value = 0x10000 +
+                                ((Value - 0xd800) << 10) + (Low - 0xdc00);
+                        I = Pair;
+                    } else {
+                        Value = 0xfffd;
+                    }
+                } else if (Value >= 0xdc00 && Value <= 0xdfff) {
+                    Value = 0xfffd;
+                }
             }
             appendUtf8(Result, Value);
             break;
@@ -289,60 +323,9 @@ bool decodeLiteral(const std::string &Spelling, std::string &Out) {
             break;
         }
     }
-    Out = Result;
+    truncateAtNul(Result);
+    Out = std::move(Result);
     return true;
-}
-
-std::string upperAscii(std::string S) {
-    for (char &C : S)
-        C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
-    return S;
-}
-
-/// Heuristic used only by --scan-literals: the first word after optional SQL
-/// comments must be a statement-starting keyword and something must follow it.
-bool looksLikeSql(const std::string &Text) {
-    static const char *Keywords[] = {
-        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
-        "ALTER",  "PRAGMA", "WITH",    "REPLACE", "VACUUM", "ATTACH",
-        "DETACH", "BEGIN",  "COMMIT",  "ROLLBACK", "EXPLAIN", "ANALYZE",
-        "REINDEX"};
-    size_t I = 0;
-    const size_t N = Text.size();
-    for (;;) {
-        while (I < N && std::isspace(static_cast<unsigned char>(Text[I])))
-            ++I;
-        if (I + 1 < N && Text[I] == '-' && Text[I + 1] == '-') {
-            I += 2;
-            while (I < N && Text[I] != '\n')
-                ++I;
-            continue;
-        }
-        if (I + 1 < N && Text[I] == '/' && Text[I + 1] == '*') {
-            const size_t End = Text.find("*/", I + 2);
-            I = End == std::string::npos ? N : End + 2;
-            continue;
-        }
-        break;
-    }
-    size_t Start = I;
-    while (I < N && (std::isalnum(static_cast<unsigned char>(Text[I])) ||
-                     Text[I] == '_'))
-        ++I;
-    if (I == Start)
-        return false;
-    const std::string Word = upperAscii(Text.substr(Start, I - Start));
-    bool Known = false;
-    for (const char *K : Keywords)
-        if (Word == K) {
-            Known = true;
-            break;
-        }
-    if (!Known)
-        return false;
-    while (I < N && std::isspace(static_cast<unsigned char>(Text[I])))
-        ++I;
-    return I < N;
 }
 
 //===----------------------------------------------------------------------===//
@@ -509,6 +492,8 @@ private:
     struct Mutation {
         unsigned endOffset;
         std::string text;
+        bool complete = false;  ///< RHS was fully statically resolved
+        bool replace = false;   ///< plain '=' replaces the previous value
     };
 
     static unsigned cursorOffset(CXCursor C, bool End) {
@@ -556,7 +541,21 @@ private:
                 Out.push_back({cursorOffset(C, true), "<dynamic>"});
             return;
         }
-        if (K == CXCursor_CompoundAssignOperator) {
+        if (K == CXCursor_BinaryOperator) {
+            // Plain assignment replaces the previous value; only recognise
+            // it when the left-hand side refers to the tracked declaration.
+            if (toStd(clang_getCursorSpelling(C)) == "=") {
+                const std::vector<CXCursor> Kids = children(C);
+                if (Kids.size() >= 2 && references(Kids.front(), Decl)) {
+                    Value Part;
+                    if (!eval(Kids.back(), Part, 0, Use))
+                        appendDynamicPart(Part);
+                    Out.push_back({cursorOffset(C, true), std::move(Part.text),
+                                   Part.complete, true});
+                    return;
+                }
+            }
+        } else if (K == CXCursor_CompoundAssignOperator) {
             const std::vector<CXCursor> Kids = children(C);
             if (Kids.size() >= 2 && references(Kids.front(), Decl)) {
                 Value Part;
@@ -569,6 +568,15 @@ private:
             const std::string Name = toStd(clang_getCursorSpelling(C));
             const int NumArgs = clang_Cursor_getNumArguments(C);
             const std::vector<CXCursor> Kids = children(C);
+            if ((Name == "operator=" || Name == "=") && NumArgs == 2 &&
+                references(clang_Cursor_getArgument(C, 0), Decl)) {
+                Value Part;
+                if (!eval(clang_Cursor_getArgument(C, 1), Part, 0, Use))
+                    appendDynamicPart(Part);
+                Out.push_back({cursorOffset(C, true), std::move(Part.text),
+                               Part.complete, true});
+                return;
+            }
             if ((Name == "operator+=" || Name == "+=") && NumArgs == 2 &&
                 references(clang_Cursor_getArgument(C, 0), Decl)) {
                 Value Part;
@@ -667,8 +675,13 @@ private:
                              return A.endOffset < B.endOffset;
                          });
         for (const Mutation &Part : Mutations) {
-            V.text += Part.text;
-            V.complete = false;
+            if (Part.replace) {
+                V.text = Part.text;
+                V.complete = Part.complete;
+            } else {
+                V.text += Part.text;
+                V.complete = false;
+            }
         }
         return true;
     }
@@ -1062,9 +1075,21 @@ private:
                             Candidates.push_back(Override);
                 }
             }
-            // Several possible producers (virtual dispatch or a function
-            // pointer table) are alternatives, not one complete statement.
-            const bool Multiple = HasOverrides || Candidates.size() > 1;
+            // Several possible producers -- or several return literals from
+            // one producer -- are alternatives, not one complete statement.
+            size_t CandidateLiterals = 0;
+            for (const std::string &Candidate : Candidates) {
+                const auto It = Index_.returns.find(Candidate);
+                if (It != Index_.returns.end())
+                    CandidateLiterals += It->second.size();
+            }
+            if (!VarUsr.empty()) {
+                const auto It = Index_.varSql.find(VarUsr);
+                if (It != Index_.varSql.end())
+                    CandidateLiterals += It->second.size();
+            }
+            const bool Multiple =
+                HasOverrides || Candidates.size() > 1 || CandidateLiterals > 1;
             const std::string ProducerOrigin =
                 HasOverrides ? "virtual" : "function";
 
@@ -1083,7 +1108,8 @@ private:
                 const auto It = Index_.varSql.find(VarUsr);
                 if (It != Index_.varSql.end())
                     for (const LiteralInfo &Lit : It->second) {
-                        emitProducer(Api, L, Lit, "callable", VarName, true);
+                        emitProducer(Api, L, Lit, "callable", VarName,
+                                     !Multiple);
                         ++Emitted;
                     }
             }
@@ -1327,23 +1353,14 @@ CXTranslationUnit parse(const std::string &Path, bool IsC,
     return TU;
 }
 
-std::string trim(const std::string &S) {
-    size_t Begin = 0, End = S.size();
-    while (Begin < End &&
-           std::isspace(static_cast<unsigned char>(S[Begin])))
-        ++Begin;
-    while (End > Begin &&
-           std::isspace(static_cast<unsigned char>(S[End - 1])))
-        --End;
-    return S.substr(Begin, End - Begin);
-}
-
 } // namespace
 
 namespace sqlinfo {
 
 bool extractSqlFromSource(const SqlOptions &options, SqlReport &report,
                           std::string &error) {
+    report = SqlReport{};
+    error.clear();
     // Explicit --api entries take precedence over the built-in table, so a
     // user can override an argument index (e.g. --api sqlite3_exec:0).
     std::vector<ApiSpec> Apis;
@@ -1388,19 +1405,8 @@ bool extractSqlFromSource(const SqlOptions &options, SqlReport &report,
         clang_disposeTranslationUnit(TU);
     }
 
-    if (options.unique) {
-        std::unordered_set<std::string> Seen;
-        std::vector<SqlStatement> Unique;
-        Unique.reserve(report.statements.size());
-        for (SqlStatement &St : report.statements)
-            if (Seen.insert(trim(St.sql)).second)
-                Unique.push_back(std::move(St));
-        report.statements = std::move(Unique);
-        report.unresolved = 0;
-        for (const SqlStatement &St : report.statements)
-            if (!St.resolved)
-                ++report.unresolved;
-    }
+    if (options.unique)
+        dedupSqlStatements(report);
 
     report.parseErrors = Failed.size();
     if (!Failed.empty()) {

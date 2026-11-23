@@ -402,6 +402,21 @@ if(Python3_Interpreter_FOUND)
               --analyzer "$<TARGET_FILE:network_loop_analyzer>")
   set_tests_properties(network_loop_analyzer_regression PROPERTIES TIMEOUT 120)
 
+  # Class extractor suite: CLI error paths, source field extraction, shared
+  # report format and content-based input detection.
+  add_test(NAME class_extractor_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/class_extractor_test.py"
+              --extractor "$<TARGET_FILE:class_extractor>")
+  set_tests_properties(class_extractor_regression PROPERTIES TIMEOUT 120)
+
+  add_test(NAME class_diff_regression
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/class_diff_test.py"
+              --binary "$<TARGET_FILE:class_diff>"
+              --clangxx "${LLVM_PREFIX}/bin/clang++")
+  set_tests_properties(class_diff_regression PROPERTIES TIMEOUT 300)
+
   function(add_bug_analyzer_regression name script)
     add_test(NAME "${name}"
         COMMAND "${Python3_EXECUTABLE}"

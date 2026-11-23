@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace sqlinfo;
@@ -39,37 +40,67 @@ void printUsage(const char *Prog) {
         "  --no-builtin              Do not match the built-in sqlite3_* APIs\n"
         "  --scan-literals           Also collect SQL-looking string literals\n"
         "                            not consumed by a resolvable API call\n"
+        "  --include-headers         Also inspect non-system headers (source only)\n"
         "  --unique                  Drop statements with duplicate SQL text\n"
+        "  --no-dispatch             Report unresolvable arguments strictly as\n"
+        "                            dynamic; skip function/virtual/fragment\n"
+        "                            inference\n"
+        "  -- <clang args...>        Pass extra flags to libclang (source only)\n"
         "  -h, --help                Show this help\n"
+        "\n"
+        "The numeric suffix of --api must be a decimal index in [0, 32].\n"
         "\n"
         "Examples:\n"
         "  %s --format sql --output schema.sql db.cpp\n"
-        "  %s --scan-literals --format json module.bc\n",
-        Prog, Prog, Prog);
+        "  %s --scan-literals --format json module.bc\n"
+        "  %s --api QSqlQuery::prepare:0 db.cpp -- -Iinclude -std=c++17\n",
+        Prog, Prog, Prog, Prog);
 }
 
-/// "name", "name:2" and "Ns::Class::name:0" are all accepted.
+/// "name", "name:2" and "Ns::Class::name:0" are accepted. A trailing ":..."
+/// that is not a decimal index and not a "::" qualifier is rejected instead
+/// of being silently treated as part of the callee name.
 bool parseApiSpec(const std::string &Raw, ApiSpec &Out, std::string &Error) {
+    if (Raw.empty()) {
+        Error = "empty --api name";
+        return false;
+    }
+    if (Raw.back() == ':') {
+        Error = "--api missing argument index after ':'";
+        return false;
+    }
+
     std::string Name = Raw;
     int ArgNo = 0;
     const size_t Colon = Raw.rfind(':');
-    if (Colon != std::string::npos && Colon + 1 < Raw.size()) {
+    if (Colon != std::string::npos) {
         const std::string Tail = Raw.substr(Colon + 1);
-        bool IsNumber = !Tail.empty();
+        bool IsNumber = true;
         for (const char C : Tail)
             if (!std::isdigit(static_cast<unsigned char>(C)))
                 IsNumber = false;
         if (IsNumber) {
+            long Value = 0;
+            for (const char C : Tail) {
+                Value = Value * 10 + static_cast<long>(C - '0');
+                if (Value > 32) {
+                    Error = "--api argument index out of range: " + Raw;
+                    return false;
+                }
+            }
             Name = Raw.substr(0, Colon);
-            ArgNo = std::atoi(Tail.c_str());
+            ArgNo = static_cast<int>(Value);
+        } else if (Colon == 0 || Raw[Colon - 1] != ':') {
+            Error = "invalid --api argument index: " + Tail;
+            return false;
         }
     }
     if (Name.empty()) {
         Error = "empty --api name";
         return false;
     }
-    if (ArgNo < 0 || ArgNo > 32) {
-        Error = "--api argument index out of range: " + Raw;
+    if (Name[0] == '-') {
+        Error = "invalid --api name: " + Name;
         return false;
     }
     Out.name = Name;
@@ -77,27 +108,84 @@ bool parseApiSpec(const std::string &Raw, ApiSpec &Out, std::string &Error) {
     return true;
 }
 
+/// Return the length of a valid UTF-8 sequence at \p Bytes, or 0 when the
+/// bytes are not valid UTF-8 (in which case \p CodePoint is left unchanged).
+size_t utf8SequenceLength(const unsigned char *Bytes, size_t Remaining,
+                          unsigned &CodePoint) {
+    const unsigned char Lead = Bytes[0];
+    size_t Length = 0;
+    unsigned Minimum = 0;
+    if (Lead < 0x80) {
+        CodePoint = Lead;
+        return 1;
+    } else if ((Lead & 0xe0) == 0xc0) {
+        Length = 2;
+        Minimum = 0x80;
+        CodePoint = Lead & 0x1f;
+    } else if ((Lead & 0xf0) == 0xe0) {
+        Length = 3;
+        Minimum = 0x800;
+        CodePoint = Lead & 0x0f;
+    } else if ((Lead & 0xf8) == 0xf0) {
+        Length = 4;
+        Minimum = 0x10000;
+        CodePoint = Lead & 0x07;
+    } else {
+        return 0;
+    }
+    if (Remaining < Length)
+        return 0;
+    for (size_t I = 1; I < Length; ++I) {
+        const unsigned char Continuation = Bytes[I];
+        if ((Continuation & 0xc0) != 0x80)
+            return 0;
+        CodePoint = (CodePoint << 6) | (Continuation & 0x3f);
+    }
+    if (CodePoint < Minimum || CodePoint > 0x10ffff)
+        return 0;
+    if (CodePoint >= 0xd800 && CodePoint <= 0xdfff)
+        return 0;
+    return Length;
+}
+
 std::string jsonEscape(const std::string &In) {
     std::string Out;
     Out.reserve(In.size() + 8);
-    for (const char C : In) {
-        switch (C) {
-        case '"': Out += "\\\""; break;
-        case '\\': Out += "\\\\"; break;
-        case '\n': Out += "\\n"; break;
-        case '\r': Out += "\\r"; break;
-        case '\t': Out += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(C) < 0x20) {
-                char Buf[8];
-                std::snprintf(Buf, sizeof(Buf), "\\u%04x",
-                              static_cast<unsigned>(C));
-                Out += Buf;
-            } else {
-                Out += C;
+    for (size_t I = 0; I < In.size();) {
+        const unsigned char C = static_cast<unsigned char>(In[I]);
+        if (C == '"') {
+            Out += "\\\"";
+        } else if (C == '\\') {
+            Out += "\\\\";
+        } else if (C == '\n') {
+            Out += "\\n";
+        } else if (C == '\r') {
+            Out += "\\r";
+        } else if (C == '\t') {
+            Out += "\\t";
+        } else if (C < 0x20) {
+            char Buf[8];
+            std::snprintf(Buf, sizeof(Buf), "\\u%04x",
+                          static_cast<unsigned>(C));
+            Out += Buf;
+        } else if (C < 0x80) {
+            Out += static_cast<char>(C);
+        } else {
+            unsigned CodePoint = 0;
+            const size_t Length = utf8SequenceLength(
+                reinterpret_cast<const unsigned char *>(In.data() + I),
+                In.size() - I, CodePoint);
+            if (Length != 0) {
+                Out.append(In, I, Length);
+                I += Length;
+                continue;
             }
-            break;
+            char Buf[8];
+            std::snprintf(Buf, sizeof(Buf), "\\u%04x",
+                          static_cast<unsigned>(C));
+            Out += Buf;
         }
+        ++I;
     }
     return Out;
 }
@@ -110,6 +198,106 @@ std::string joinStrings(const std::vector<std::string> &Items) {
         Out += Items[I];
     }
     return Out;
+}
+
+std::string trim(const std::string &S) {
+    size_t Begin = 0, End = S.size();
+    while (Begin < End &&
+           std::isspace(static_cast<unsigned char>(S[Begin])))
+        ++Begin;
+    while (End > Begin &&
+           std::isspace(static_cast<unsigned char>(S[End - 1])))
+        --End;
+    return S.substr(Begin, End - Begin);
+}
+
+std::string sanitizeField(const std::string &S) {
+    std::string Out;
+    Out.reserve(S.size());
+    for (const char C : S) {
+        const unsigned char U = static_cast<unsigned char>(C);
+        Out += (U < 0x20 || U == 0x7f) ? ' ' : C;
+    }
+    return Out;
+}
+
+std::vector<std::string> sanitizeAll(const std::vector<std::string> &Items) {
+    std::vector<std::string> Out;
+    Out.reserve(Items.size());
+    for (const std::string &Item : Items)
+        Out.push_back(sanitizeField(Item));
+    return Out;
+}
+
+std::string upperAscii(std::string S) {
+    for (char &C : S)
+        C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
+    return S;
+}
+
+/// Canonical heuristic for --scan-literals, shared by both backends.
+bool looksLikeSqlImpl(const std::string &Text) {
+    static const char *Keywords[] = {
+        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
+        "ALTER",  "PRAGMA", "WITH",   "REPLACE", "VACUUM", "ATTACH",
+        "DETACH", "BEGIN",  "COMMIT", "ROLLBACK", "EXPLAIN", "ANALYZE",
+        "REINDEX", "TRUNCATE", "GRANT", "REVOKE"};
+    size_t I = 0;
+    const size_t N = Text.size();
+    for (;;) {
+        while (I < N && std::isspace(static_cast<unsigned char>(Text[I])))
+            ++I;
+        if (I + 1 < N && Text[I] == '-' && Text[I + 1] == '-') {
+            I += 2;
+            while (I < N && Text[I] != '\n')
+                ++I;
+            continue;
+        }
+        if (I + 1 < N && Text[I] == '/' && Text[I + 1] == '*') {
+            const size_t End = Text.find("*/", I + 2);
+            I = End == std::string::npos ? N : End + 2;
+            continue;
+        }
+        break;
+    }
+    const size_t Start = I;
+    while (I < N && (std::isalnum(static_cast<unsigned char>(Text[I])) ||
+                     Text[I] == '_'))
+        ++I;
+    if (I == Start)
+        return false;
+    const std::string Word = upperAscii(Text.substr(Start, I - Start));
+    bool Known = false;
+    for (const char *Keyword : Keywords)
+        if (Word == Keyword) {
+            Known = true;
+            break;
+        }
+    if (!Known)
+        return false;
+    while (I < N && std::isspace(static_cast<unsigned char>(Text[I])))
+        ++I;
+    return I < N;
+}
+
+std::string dedupKey(const SqlStatement &St) {
+    if (St.resolved)
+        return trim(St.sql);
+    // Dynamic calls have empty SQL text; deduplicate them by call site
+    // instead of collapsing all of them into a single empty key.
+    std::string Key = "dynamic\x1f";
+    Key += St.api;
+    Key += "\x1f";
+    Key += St.origin;
+    Key += "\x1f";
+    Key += St.symbol;
+    Key += "\x1f";
+    Key += St.file;
+    Key += "\x1f";
+    Key += std::to_string(St.line);
+    Key += ":";
+    Key += std::to_string(St.column);
+    return Key;
 }
 
 const char *boolText(bool Value) { return Value ? "true" : "false"; }
@@ -174,18 +362,22 @@ void writeJson(std::string &Out, const SqlReport &Report) {
 }
 
 void writeText(std::string &Out, const SqlReport &Report) {
-    Out += "#inputs " + joinStrings(Report.inputs) + "\n";
-    Out += "#apis " + joinStrings(apiLabels(Report)) + "\n";
+    Out += "#inputs " + joinStrings(sanitizeAll(Report.inputs)) + "\n";
+    Out += "#apis " + joinStrings(sanitizeAll(apiLabels(Report))) + "\n";
     Out += "#statements " + std::to_string(Report.statements.size()) +
            " resolved " + std::to_string(countResolved(Report)) +
            " dynamic " + std::to_string(Report.unresolved) +
            " parse_errors " + std::to_string(Report.parseErrors) + "\n";
     for (const SqlStatement &St : Report.statements) {
-        Out += St.file + ":" + std::to_string(St.line) + ":" +
-               std::to_string(St.column) + "\t" + St.origin + "\t" +
-               (St.api.empty() ? std::string("(literal)") : St.api) + "\t" +
-               stateText(St) + "\t" +
-               (St.symbol.empty() ? std::string("-") : St.symbol) + "\t" +
+        Out += sanitizeField(St.file) + ":" + std::to_string(St.line) + ":" +
+               std::to_string(St.column) + "\t" + sanitizeField(St.origin) +
+               "\t" +
+               (St.api.empty() ? std::string("(literal)")
+                               : sanitizeField(St.api)) +
+               "\t" + stateText(St) + "\t" +
+               (St.symbol.empty() ? std::string("-")
+                                  : sanitizeField(St.symbol)) +
+               "\t" +
                (St.resolved ? jsonEscape(St.sql) : std::string("<dynamic>")) +
                "\n";
     }
@@ -196,13 +388,15 @@ void writeText(std::string &Out, const SqlReport &Report) {
 /// documents what could not be extracted.
 void writeSqlScript(std::string &Out, const SqlReport &Report) {
     Out += "-- Extracted SQLite SQL scripts\n-- inputs: " +
-           joinStrings(Report.inputs) + "\n";
+           joinStrings(sanitizeAll(Report.inputs)) + "\n";
     for (const SqlStatement &St : Report.statements) {
-        Out += "\n-- " + St.file + ":" + std::to_string(St.line) + " " +
-               (St.api.empty() ? St.origin : St.api) + " [" +
-               stateText(St) + "]" +
+        Out += "\n-- " + sanitizeField(St.file) + ":" +
+               std::to_string(St.line) + " " +
+               (St.api.empty() ? sanitizeField(St.origin)
+                               : sanitizeField(St.api)) +
+               " [" + stateText(St) + "]" +
                (St.symbol.empty() ? std::string()
-                                  : " via " + St.symbol) +
+                                  : " via " + sanitizeField(St.symbol)) +
                "\n";
         if (!St.resolved) {
             Out += "-- SQL argument is built at runtime; not extractable\n";
@@ -230,8 +424,15 @@ void writeSqlScript(std::string &Out, const SqlReport &Report) {
             Text.pop_back();
         if (Text.empty())
             continue;
-        if (Text.back() != ';')
-            Text += ";";
+        if (Text.back() != ';') {
+            const size_t LastNewline = Text.find_last_of('\n');
+            const std::string LastLine =
+                LastNewline == std::string::npos
+                    ? Text
+                    : Text.substr(LastNewline + 1);
+            // A trailing SQL line comment would swallow the semicolon.
+            Text += LastLine.find("--") == std::string::npos ? ";" : "\n;";
+        }
         Out += Text + "\n";
     }
 }
@@ -258,6 +459,12 @@ void printSqlUsage(const char *Prog) { printUsage(Prog); }
 
 bool parseSqlArgs(int argc, char **argv, SqlOptions &Options,
                   std::string &Error) {
+    Error.clear();
+    const auto LooksLikeOption = [](const std::string &S) {
+        return S.size() >= 2 && S[0] == '-' &&
+               (S[1] == '-' || std::isalpha(static_cast<unsigned char>(S[1])));
+    };
+
     bool AfterDashDash = false;
     for (int I = 1; I < argc; ++I) {
         const std::string Arg = argv[I];
@@ -266,11 +473,15 @@ bool parseSqlArgs(int argc, char **argv, SqlOptions &Options,
         } else if (Arg == "--") {
             AfterDashDash = true;
         } else if (Arg == "--format" || Arg == "--output" || Arg == "--api") {
-            if (I + 1 >= argc) {
+            if (I + 1 >= argc || LooksLikeOption(argv[I + 1])) {
                 Error = "missing value for " + Arg;
                 return false;
             }
             const std::string Value = argv[++I];
+            if (Value.empty()) {
+                Error = "empty value for " + Arg;
+                return false;
+            }
             if (Arg == "--format") {
                 if (Value != "json" && Value != "text" && Value != "sql") {
                     Error = "unknown --format '" + Value +
@@ -290,20 +501,23 @@ bool parseSqlArgs(int argc, char **argv, SqlOptions &Options,
             Options.useBuiltinApis = false;
         } else if (Arg == "--scan-literals") {
             Options.scanLiterals = true;
+        } else if (Arg == "--include-headers") {
+            Options.includeHeaders = true;
         } else if (Arg == "--unique") {
             Options.unique = true;
         } else if (Arg == "--no-dispatch") {
             Options.dispatch = false;
         } else if (Arg == "-h" || Arg == "--help") {
-            printUsage(argv[0]);
-            std::exit(0);
-        } else if (Arg.rfind("--", 0) == 0) {
+            Options.help = true;
+        } else if (LooksLikeOption(Arg)) {
             Error = "unknown option: " + Arg;
             return false;
         } else {
             Options.inputs.push_back(Arg);
         }
     }
+    if (Options.help)
+        return true;
     if (Options.inputs.empty()) {
         Error = "no input file given";
         return false;
@@ -313,13 +527,18 @@ bool parseSqlArgs(int argc, char **argv, SqlOptions &Options,
 
 bool writeSqlReport(const SqlReport &report, const SqlOptions &options,
                     std::string &error) {
+    error.clear();
     std::string Out;
     if (options.format == "json")
         writeJson(Out, report);
     else if (options.format == "text")
         writeText(Out, report);
-    else
+    else if (options.format == "sql")
         writeSqlScript(Out, report);
+    else {
+        error = "unknown report format: " + options.format;
+        return false;
+    }
 
     if (options.output.empty()) {
         const bool Ok =
@@ -335,11 +554,33 @@ bool writeSqlReport(const SqlReport &report, const SqlOptions &options,
         return false;
     }
     File << Out;
+    File.flush();
     if (!File) {
         error = "cannot write output file: " + options.output;
         return false;
     }
+    File.close();
+    if (!File) {
+        error = "cannot close output file: " + options.output;
+        return false;
+    }
     return true;
+}
+
+bool looksLikeSql(const std::string &text) { return looksLikeSqlImpl(text); }
+
+void dedupSqlStatements(SqlReport &report) {
+    std::unordered_set<std::string> Seen;
+    std::vector<SqlStatement> Unique;
+    Unique.reserve(report.statements.size());
+    for (const SqlStatement &St : report.statements)
+        if (Seen.insert(dedupKey(St)).second)
+            Unique.push_back(St);
+    report.statements = std::move(Unique);
+    report.unresolved = 0;
+    for (const SqlStatement &St : report.statements)
+        if (!St.resolved)
+            ++report.unresolved;
 }
 
 } // namespace sqlinfo

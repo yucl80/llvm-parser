@@ -14,6 +14,7 @@
 #include <clang-c/Index.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,43 @@ bool isMethodKind(CXCursorKind K) {
 bool isContainerKind(CXCursorKind K) {
     return isClassKind(K) || K == CXCursor_Namespace ||
            K == CXCursor_LinkageSpec || K == CXCursor_UnexposedDecl;
+}
+
+struct SiblingIndexCtx {
+    CXCursor target;
+    CXCursorKind kind;
+    unsigned count = 0;
+};
+
+CXChildVisitResult siblingIndexVisitor(CXCursor C, CXCursor,
+                                       CXClientData Data) {
+    SiblingIndexCtx& Ctx = *static_cast<SiblingIndexCtx*>(Data);
+    if (clang_equalCursors(C, Ctx.target))
+        return CXChildVisit_Break;
+    if (clang_getCursorKind(C) == Ctx.kind)
+        ++Ctx.count;
+    return CXChildVisit_Continue;
+}
+
+/// Ordinal among same-kind siblings. Unlike a line number this stays stable
+/// when code is reformatted or moved inside the file.
+unsigned sameKindSiblingIndex(CXCursor C) {
+    const CXCursor Parent = clang_getCursorSemanticParent(C);
+    if (clang_Cursor_isNull(Parent))
+        return 0;
+    SiblingIndexCtx Ctx{C, clang_getCursorKind(C), 0};
+    clang_visitChildren(Parent, &siblingIndexVisitor, &Ctx);
+    return Ctx.count;
+}
+
+std::string anonymousComponent(CXCursor C, CXCursorKind K,
+                               const std::string& Rel) {
+    const char* What = isClassKind(K)     ? "class"
+                       : K == CXCursor_Namespace ? "namespace"
+                       : K == CXCursor_EnumDecl  ? "enum"
+                                                 : "scope";
+    return "(anonymous " + std::string(What) + "@" + Rel + "#" +
+           std::to_string(sameKindSiblingIndex(C) + 1) + ")";
 }
 
 struct CompileArgs {
@@ -180,7 +218,7 @@ bool projectLocation(CXCursor C, const VisitCtx& Ctx, std::string& Rel,
 }
 
 /// "ns::Outer::Foo" — spelling based so it stays stable across the two trees.
-std::string qualifiedName(CXCursor C, const std::string& Rel, unsigned Line) {
+std::string qualifiedName(CXCursor C, const std::string& Rel) {
     std::vector<std::string> Parts;
     for (CXCursor P = C; !clang_Cursor_isNull(P);
          P = clang_getCursorSemanticParent(P)) {
@@ -193,11 +231,15 @@ std::string qualifiedName(CXCursor C, const std::string& Rel, unsigned Line) {
         std::string N = toStd(clang_getCursorSpelling(P));
         if (N.empty())
             N = toStd(clang_getCursorDisplayName(P));
-        if (N.empty() || N == "(anonymous)" ||
-            N.find("anonymous") != std::string::npos) {
-            N = isClassKind(K)
-                    ? "(anonymous@" + Rel + ":" + std::to_string(Line) + ")"
-                    : std::string();
+        const bool Anonymous =
+            N.empty() || N == "(anonymous)" || startsWith(N, "(anonymous") ||
+            startsWith(N, "(unnamed ") || startsWith(N, "(lambda at ");
+        if (Anonymous) {
+            if (isClassKind(K) || K == CXCursor_Namespace ||
+                K == CXCursor_EnumDecl)
+                N = anonymousComponent(P, K, Rel);
+            else
+                N.clear();
         }
         if (!N.empty())
             Parts.push_back(N);
@@ -239,18 +281,65 @@ std::string parameterTypes(CXCursor M) {
     return join(Types, ", ");
 }
 
+/// Suffix of the function type, e.g. "const &" or "volatile noexcept".
+/// libclang has no dedicated ref-qualifier accessor, but the type spelling
+/// carries all cv/ref/noexcept qualifiers that distinguish member overloads.
+std::string methodQualifiers(CXCursor M) {
+    const std::string Type = toStd(clang_getTypeSpelling(clang_getCursorType(M)));
+    const size_t Paren = Type.rfind(')');
+    if (Paren == std::string::npos)
+        return std::string();
+    std::string Raw = Type.substr(Paren + 1);
+    std::string Result;
+    bool PendingSpace = false;
+    for (char C : Raw) {
+        if (C == ' ' || C == '\t' || C == '\n' || C == '\r') {
+            PendingSpace = true;
+            continue;
+        }
+        if (PendingSpace && !Result.empty())
+            Result += ' ';
+        Result += C;
+        PendingSpace = false;
+    }
+    return Result.empty() ? std::string() : " " + Result;
+}
+
+bool hasToken(const std::string& S, const char* Token) {
+    const std::string T(Token);
+    size_t Pos = S.find(T);
+    while (Pos != std::string::npos) {
+        const bool LeftOk = Pos == 0 || !std::isalnum(static_cast<unsigned char>(S[Pos - 1]));
+        const size_t End = Pos + T.size();
+        const bool RightOk =
+            End == S.size() || !std::isalnum(static_cast<unsigned char>(S[End]));
+        if (LeftOk && RightOk)
+            return true;
+        Pos = S.find(T, Pos + 1);
+    }
+    return false;
+}
+
 std::string methodTraits(CXCursor M) {
     const bool IsTemplate =
         clang_getCursorKind(M) == CXCursor_FunctionTemplate;
-    auto bit = [](unsigned V) { return V ? "1" : "0"; };
+    const std::string Qual = methodQualifiers(M);
+    const bool IsStatic =
+        IsTemplate ? clang_Cursor_getStorageClass(M) == CX_SC_Static
+                   : clang_CXXMethod_isStatic(M) != 0;
+    const bool IsConst =
+        IsTemplate ? hasToken(Qual, "const") : clang_CXXMethod_isConst(M) != 0;
+    auto bit = [](bool V) { return V ? "1" : "0"; };
     std::string T;
     T += "access=" + accessStr(clang_getCXXAccessSpecifier(M));
-    T += ";static=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isStatic(M)));
-    T += ";virtual=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isVirtual(M)));
-    T += ";pure=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isPureVirtual(M)));
-    T += ";const=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isConst(M)));
-    T += ";deleted=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isDeleted(M)));
-    T += ";defaulted=" + std::string(bit(IsTemplate ? 0 : clang_CXXMethod_isDefaulted(M)));
+    T += ";static=" + std::string(bit(IsStatic));
+    T += ";virtual=" +
+         std::string(bit(!IsTemplate && clang_CXXMethod_isVirtual(M)));
+    T += ";pure=" +
+         std::string(bit(!IsTemplate && clang_CXXMethod_isPureVirtual(M)));
+    T += ";const=" + std::string(bit(IsConst));
+    T += ";deleted=" + std::string(bit(clang_CXXMethod_isDeleted(M) != 0));
+    T += ";defaulted=" + std::string(bit(clang_CXXMethod_isDefaulted(M) != 0));
     return T;
 }
 
@@ -292,21 +381,29 @@ CXChildVisitResult classMemberVisitor(CXCursor C, CXCursor, CXClientData Data) {
     return CXChildVisit_Continue;
 }
 
+void initClassRecord(ClassRecord& R, const std::string& Name,
+                     const std::string& Kind, const std::string& Rel,
+                     unsigned Line) {
+    if (R.name.empty())
+        R.name = Name;
+    if (R.kind.empty())
+        R.kind = Kind;
+    if (R.file.empty()) {
+        R.file = Rel;
+        R.line = Line;
+    }
+}
+
 void handleClass(CXCursor C, const VisitCtx& Ctx) {
     std::string Rel;
     unsigned Line = 0;
     if (!projectLocation(C, Ctx, Rel, Line))
         return;
-    const std::string Name = qualifiedName(C, Rel, Line);
+    const std::string Name = qualifiedName(C, Rel);
     if (Name.empty() || !clang_isCursorDefinition(C))
         return;
     ClassRecord& R = Ctx.snap->classes[Name];
-    if (R.name.empty()) {
-        R.name = Name;
-        R.kind = classKind(C);
-        R.file = Rel;
-        R.line = Line;
-    }
+    initClassRecord(R, Name, classKind(C), Rel, Line);
     clang_visitChildren(C, &classMemberVisitor, &R);
 }
 
@@ -319,18 +416,22 @@ void handleMethod(CXCursor M, const VisitCtx& Ctx) {
     if (!projectLocation(M, Ctx, Rel, Line))
         return;
 
-    const std::string Class = qualifiedName(Parent, Rel, Line);
+    std::string ClassRel = Rel;
+    unsigned ClassLine = Line;
+    if (!projectLocation(Parent, Ctx, ClassRel, ClassLine)) {
+        ClassRel = Rel;
+        ClassLine = Line;
+    }
+    const std::string Class = qualifiedName(Parent, ClassRel);
     if (Class.empty())
         return;
     const std::string Name = toStd(clang_getCursorSpelling(M));
     const std::string Params = parameterTypes(M);
+    const std::string Qual = methodQualifiers(M);
     const bool IsTemplate =
         clang_getCursorKind(M) == CXCursor_FunctionTemplate;
-    const bool IsConst = !IsTemplate && clang_CXXMethod_isConst(M) != 0;
 
-    std::string Key = Class + "::" + Name + "(" + Params + ")";
-    if (IsConst)
-        Key += " const";
+    std::string Key = Class + "::" + Name + "(" + Params + ")" + Qual;
     if (IsTemplate)
         Key += " [template]";
     std::string Display = Key;
@@ -344,8 +445,7 @@ void handleMethod(CXCursor M, const VisitCtx& Ctx) {
     const std::string Hash = fingerprint(Tokens);
 
     ClassRecord& C = Ctx.snap->classes[Class];
-    if (C.name.empty())
-        C.name = Class;
+    initClassRecord(C, Class, classKind(Parent), ClassRel, ClassLine);
     MethodRecord& Rec = C.methods[Key];
     if (Rec.key.empty()) {
         Rec.key = Key;

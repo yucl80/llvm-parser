@@ -19,14 +19,17 @@
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/User.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -262,9 +265,75 @@ std::string irValueString(const llvm::Value* V,
     return "v" + std::to_string(It->second);
 }
 
+std::string stripDbgMetadata(const std::string& S) {
+    static const std::string Key = "!dbg !";
+    std::string R = S;
+    size_t Pos = 0;
+    while ((Pos = R.find(Key, Pos)) != std::string::npos) {
+        size_t End = Pos + Key.size();
+        while (End < R.size() && std::isdigit(static_cast<unsigned char>(R[End])))
+            ++End;
+        size_t Begin = Pos;
+        while (Begin > 0 && (R[Begin - 1] == ' ' || R[Begin - 1] == '\t'))
+            --Begin;
+        if (Begin > 0 && R[Begin - 1] == ',')
+            --Begin;
+        R.erase(Begin, End - Begin);
+        Pos = Begin;
+    }
+    return R;
+}
+
+std::string instructionText(const llvm::Instruction& I) {
+    std::string S;
+    llvm::raw_string_ostream OS(S);
+    I.print(OS);
+    OS.flush();
+    return stripDbgMetadata(S);
+}
+
+void collectGlobalInitializers(const llvm::Value* V,
+                               std::vector<std::string>& Out,
+                               std::set<const llvm::GlobalVariable*>& Seen,
+                               int Depth = 0);
+
+void addGlobalVariable(const llvm::GlobalVariable* GV,
+                       std::vector<std::string>& Out,
+                       std::set<const llvm::GlobalVariable*>& Seen,
+                       int Depth) {
+    if (!GV || GV->isDeclaration() || !Seen.insert(GV).second || Depth > 8)
+        return;
+    std::string S;
+    llvm::raw_string_ostream OS(S);
+    OS << "global " << GV->getName().str() << " | " << *GV;
+    OS.flush();
+    Out.push_back("global|" + stripDbgMetadata(S));
+    if (GV->hasInitializer())
+        collectGlobalInitializers(GV->getInitializer(), Out, Seen, Depth + 1);
+}
+
+void collectGlobalInitializers(const llvm::Value* V,
+                               std::vector<std::string>& Out,
+                               std::set<const llvm::GlobalVariable*>& Seen,
+                               int Depth) {
+    if (!V || Depth > 8)
+        return;
+    if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(V)) {
+        addGlobalVariable(GV, Out, Seen, Depth);
+        return;
+    }
+    const auto* User = llvm::dyn_cast<llvm::User>(V);
+    if (!User)
+        return;
+    for (const llvm::Use& U : User->operands())
+        if (llvm::isa<llvm::Constant>(U.get()))
+            collectGlobalInitializers(U.get(), Out, Seen, Depth + 1);
+}
+
 std::vector<std::string> irBodyTokens(const llvm::Function& F) {
     std::vector<std::string> Out;
     std::map<const llvm::Value*, unsigned> Ids;
+    std::set<const llvm::GlobalVariable*> SeenGlobals;
     for (const llvm::BasicBlock& BB : F) {
         Out.push_back("bb");
         for (const llvm::Instruction& I : BB) {
@@ -277,18 +346,51 @@ std::vector<std::string> irBodyTokens(const llvm::Function& F) {
             }
             std::string Line = I.getOpcodeName();
             Line += "|" + irTypeString(I.getType());
-            for (const llvm::Use& U : I.operands())
+            for (const llvm::Use& U : I.operands()) {
                 Line += "|" + irValueString(U.get(), Ids);
+                collectGlobalInitializers(U.get(), Out, SeenGlobals);
+            }
             if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
                 if (const llvm::Function* Callee = CB->getCalledFunction())
                     Line += "|callee:" + Callee->getName().str();
                 else
                     Line += "|callee:indirect";
             }
+            Line += "|text:" + instructionText(I);
             Out.push_back(std::move(Line));
         }
     }
     return Out;
+}
+
+/// End of an operator token such as "operator<", "operator<<" or
+/// "operator<=>". These angle brackets are part of the function name, not
+/// template delimiters, so they must not affect the nesting counter.
+size_t operatorSymbolEnd(const std::string& S, size_t I) {
+    static const char* const Keyword = "operator";
+    static const size_t KeywordLen = 8;
+    static const char* const Symbols[] = {
+        "<=>", "<<=", ">>=", "<<", ">>", "<=", ">=", "->*", "->",
+        "()", "[]", "++", "--", "+=", "-=", "*=", "/=", "%=",
+        "&=", "|=", "^=", "new[]", "delete[]", "new", "delete",
+        "+", "-", "*", "/", "%", "^", "&", "|", "~", "!", "=",
+        "<", ">"};
+    if (I > 0 && (std::isalnum(static_cast<unsigned char>(S[I - 1])) ||
+                  S[I - 1] == '_'))
+        return std::string::npos;
+    if (I + KeywordLen > S.size() ||
+        S.compare(I, KeywordLen, Keyword) != 0)
+        return std::string::npos;
+    size_t J = I + KeywordLen;
+    while (J < S.size() &&
+           (S[J] == ' ' || S[J] == '\t' || S[J] == '\n'))
+        ++J;
+    for (const char* Symbol : Symbols) {
+        const size_t N = std::strlen(Symbol);
+        if (J + N <= S.size() && S.compare(J, N, Symbol) == 0)
+            return J + N;
+    }
+    return std::string::npos;
 }
 
 /// Turn "app::Widget::set(int)" into class="app::Widget" and keep the whole
@@ -300,6 +402,11 @@ bool splitDemangled(const std::string& D, std::string& Class,
     size_t Paren = std::string::npos;
     int Angle = 0;
     for (size_t I = 0; I < D.size(); ++I) {
+        const size_t OpEnd = operatorSymbolEnd(D, I);
+        if (OpEnd != std::string::npos) {
+            I = OpEnd - 1;
+            continue;
+        }
         const char C = D[I];
         if (C == '<') {
             ++Angle;
@@ -317,6 +424,11 @@ bool splitDemangled(const std::string& D, std::string& Class,
     size_t Sep = std::string::npos;
     int A2 = 0;
     for (size_t I = 0; I + 1 < Head.size(); ++I) {
+        const size_t OpEnd = operatorSymbolEnd(Head, I);
+        if (OpEnd != std::string::npos) {
+            I = OpEnd - 1;
+            continue;
+        }
         if (Head[I] == '<') {
             ++A2;
         } else if (Head[I] == '>') {
@@ -352,6 +464,15 @@ std::string diFilePath(const llvm::DIFile* F) {
         return normPath(Name);
     const std::string Dir = F->getDirectory().str();
     return normPath(Dir.empty() ? Name : Dir + "/" + Name);
+}
+
+std::string relativeToRoot(const std::string& Root, const std::string& Abs) {
+    if (Abs.empty())
+        return std::string();
+    const std::string P = normPath(Abs);
+    if (!Root.empty() && startsWith(P, Root))
+        return P.substr(Root.size());
+    return fs::path(P).filename().generic_string();
 }
 
 /// Directories of the compile units' source files (plus their parents, so a
@@ -407,8 +528,8 @@ bool isLibraryClass(const std::string& C, const Options& O) {
 }
 
 void collectBitcodeHits(const llvm::Module& M, const std::string& Rel,
-                        const Options& O, std::vector<BCHit>& Hits,
-                        bool& HasDebugInfo) {
+                        const std::string& Root, const Options& O,
+                        std::vector<BCHit>& Hits, bool& HasDebugInfo) {
     if (!M.debug_compile_units().empty())
         HasDebugInfo = true;
     const std::vector<std::string> AppDirs = appSourceDirs(M);
@@ -424,12 +545,16 @@ void collectBitcodeHits(const llvm::Module& M, const std::string& Rel,
         const std::string Cls = diQualifiedName(CT);
         if (Cls.empty() || isLibraryClass(Cls, O))
             continue;
-        if (!inAppTree(AppDirs, diFilePath(CT->getFile())))
+        const std::string ClassAbs = diFilePath(CT->getFile());
+        const std::string ClassRel = relativeToRoot(Root, ClassAbs);
+        if (isIgnored(ClassRel, O.ignores))
+            continue;
+        if (!inAppTree(AppDirs, ClassAbs))
             continue;  // system-header type retained through #include
         BCHit Layout;
         Layout.cls = Cls;
         Layout.kind = diKindName(CT->getTag());
-        Layout.file = CT->getFilename().str();
+        Layout.file = ClassRel.empty() ? CT->getFilename().str() : ClassRel;
         Layout.line = CT->getLine();
         for (const llvm::DINode* E : CT->getElements()) {
             if (const auto* D = llvm::dyn_cast<llvm::DIDerivedType>(E)) {
@@ -466,11 +591,15 @@ void collectBitcodeHits(const llvm::Module& M, const std::string& Rel,
                 }
                 if (isLibraryClass(Cls2, O))
                     continue;
+                const std::string MethodAbs = diFilePath(SP->getFile());
+                const std::string MethodRel = relativeToRoot(Root, MethodAbs);
+                if (isIgnored(MethodRel, O.ignores))
+                    continue;
                 BCHit H;
                 H.cls = Cls2;
                 H.key = Key;
                 H.display = Key;
-                H.file = SP->getFilename().str();
+                H.file = MethodRel.empty() ? SP->getFilename().str() : MethodRel;
                 H.line = SP->getLine();
                 H.declHash = spDeclFingerprint(SP);
                 Hits.push_back(std::move(H));
@@ -489,6 +618,15 @@ void collectBitcodeHits(const llvm::Module& M, const std::string& Rel,
         if (!splitDemangled(D, Cls, Key) || isLibraryClass(Cls, O))
             continue;
         const llvm::DISubprogram* SP = F.getSubprogram();
+        std::string FuncRel = Rel;
+        if (SP) {
+            const std::string FuncAbs = diFilePath(SP->getFile());
+            const std::string Candidate = relativeToRoot(Root, FuncAbs);
+            if (!Candidate.empty())
+                FuncRel = Candidate;
+        }
+        if (isIgnored(FuncRel, O.ignores))
+            continue;
         BCHit H;
         H.cls = Cls;
         H.key = Key;
@@ -501,12 +639,9 @@ void collectBitcodeHits(const llvm::Module& M, const std::string& Rel,
              "linkage=" + std::to_string(static_cast<unsigned>(F.getLinkage())),
              "cc=" + std::to_string(F.getCallingConv()),
              spDeclFingerprint(SP), spParamList(SP)});
-        if (SP) {
-            H.file = SP->getFilename().str();
+        H.file = FuncRel.empty() ? Rel : FuncRel;
+        if (SP)
             H.line = SP->getLine();
-        }
-        if (H.file.empty())
-            H.file = Rel;
         Hits.push_back(std::move(H));
     }
 }
@@ -527,7 +662,7 @@ void buildBitcodeSnapshot(Snapshot& S, const Options& O) {
             startsWith(Abs, S.root)
                 ? Abs.substr(S.root.size())
                 : fs::path(Abs).filename().generic_string();
-        collectBitcodeHits(*M, Rel, O, Hits, S.hasDebugInfo);
+        collectBitcodeHits(*M, Rel, S.root, O, Hits, S.hasDebugInfo);
     }
 
     // A method may be emitted in several modules and as several ABI variants

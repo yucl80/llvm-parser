@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <ostream>
+#include <string_view>
 
 std::string tsvEscape(const std::string& in) {
     std::string out;
@@ -29,9 +30,10 @@ static inline void appendNum(std::string& out, unsigned v) {
 /// Append a field, escaping the tab/newline/CR/backslash separators. The
 /// common case (no specials) is a single find + append — no allocation; only
 /// fields that actually contain a special character pay the escaping loop.
-static inline void appendEscaped(std::string& out, const std::string& in) {
-    if (in.find_first_of("\\\t\n\r") == std::string::npos) {
-        out.append(in);
+static inline void appendEscaped(std::string& out, std::string_view in) {
+    static constexpr std::string_view kEscapes = "\\\t\n\r";
+    if (in.find_first_of(kEscapes) == std::string_view::npos) {
+        out.append(in.data(), in.size());
         return;
     }
     for (char c : in) {
@@ -49,7 +51,7 @@ void writeSpanLine(std::ostream& os,
                    const FuncInfo& info,
                    unsigned span_id,
                    const std::optional<unsigned>& parent_span_id,
-                   const std::string& kind,
+                   std::string_view kind,
                    unsigned depth,
                    bool cycle,
                    const std::optional<CallSiteLoc>& call_loc) {
@@ -66,7 +68,7 @@ void writeSpanLine(std::ostream& os,
     buf.push_back('\t');
     if (parent_span_id) appendNum(buf, *parent_span_id);
     buf.push_back('\t');
-    buf.append(kind);
+    buf.append(kind.data(), kind.size());
     buf.push_back('\t');
     appendNum(buf, depth);
     buf.push_back('\t');

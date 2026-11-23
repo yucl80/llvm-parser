@@ -5,27 +5,29 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <filesystem>
+#include <unordered_map>
 #include <utility>
 
-/// Strip the outermost parameter list of a demangled name:
+/// Remove the trailing parameter list from a demangled name:
 ///   "foo(int)"                                  -> "foo"
 ///   "operator()(int)"                           -> "operator()"
 ///   "(anonymous namespace)::Service::get(int)"  -> "(anonymous namespace)::Service::get"
 ///
 /// The parameter list is the *last balanced* parenthesis group, not the first
-/// '('. The Itanium demangler spells unnamed namespaces as
-/// "(anonymous namespace)", and function/template parameters can contain
-/// parentheses of their own ("foo(void (*)(int))"). Cutting at the first '('
-/// used to erase the whole name of every function in an anonymous namespace,
-/// so those spans were written with an empty function column.
+/// '(': unnamed namespaces demangle to "(anonymous namespace)", and parameter
+/// types can themselves contain parentheses, e.g. "foo(void (*)(int))".
+/// Cutting at the first '(' would blank out every function in an anonymous
+/// namespace.
 std::string stripParams(std::string s) {
     const size_t close = s.rfind(')');
     if (close == std::string::npos)
         return s;  // C symbol or an undemangled name: no parameter list
 
-    // Walk back from the final ')' to the '(' that balances it. Nested groups
-    // are counted so they cannot be mistaken for the parameter list.
+    // Scan backwards from the final ')' to its matching '(', counting nested
+    // parentheses so an inner ')' is not mistaken for the parameter list.
     int depth = 0;
     for (size_t i = close + 1; i-- > 0;) {
         if (s[i] == ')') {
@@ -38,15 +40,35 @@ std::string stripParams(std::string s) {
     return s;
 }
 
-/// True when an Itanium-mangled symbol belongs to std:: or __gnu_cxx::.
-/// The demangled name cannot answer this: template instantiations demangle with
-/// a leading return type that hides the namespace. In the mangled name, after
-/// "_Z" (and each "Z" of a nested local name), "N" introduces the outermost
-/// scope: "St" stands for std, "9__gnu_cxx" for __gnu_cxx. Symbols not starting
-/// with "_Z" (C functions, LLVM intrinsics) are never namespace members.
+/// Detect std:: / __gnu_cxx:: membership from the mangled name.
+///
+/// Why not the demangled name? Template instantiations demangle with a leading
+/// return type, which hides the namespace prefix.
+///
+/// Itanium mangling: after "_Z" (and each "Z" of a nested local name), "N"
+/// introduces the outermost scope. std has three spellings there:
+///   "St"                - the plain substitution
+///   "9__gnu_cxx"        - the libstdc++ extension namespace
+///   "Sa/Sb/Ss/Si/So/Sd" - one-letter substitutions for allocator,
+///                         basic_string, string, istream, ostream, iostream
+///
+/// "Th"/"Tv"/"Tc" thunks are skipped so thunks to std members are recognised.
+/// Symbols not starting with "_Z" (C functions, LLVM intrinsics) have no
+/// namespace.
 static bool isStdNamespaceMangled(const std::string& mangled) {
     if (mangled.rfind("_Z", 0) != 0) return false;
     size_t i = 2;
+
+    // Thunks encode "_Z<kind><offset>_<target>"; skip the offset so the target
+    // can be inspected with the normal rules below.
+    if (i + 1 < mangled.size() && mangled[i] == 'T' &&
+        (mangled[i + 1] == 'h' || mangled[i + 1] == 'v' ||
+         mangled[i + 1] == 'c')) {
+        i += 2;
+        while (i < mangled.size() && mangled[i] != '_') ++i;
+        if (i < mangled.size()) ++i;
+    }
+
     while (i < mangled.size() && mangled[i] == 'Z') ++i;
     if (i < mangled.size() && mangled[i] == 'N') {
         ++i;
@@ -56,17 +78,22 @@ static bool isStdNamespaceMangled(const std::string& mangled) {
                                       mangled[i] == 'O'))
             ++i;
     }
-    return mangled.compare(i, 2, "St") == 0 ||
-           mangled.compare(i, 10, "9__gnu_cxx") == 0;
+    if (mangled.compare(i, 2, "St") == 0 ||
+        mangled.compare(i, 10, "9__gnu_cxx") == 0)
+        return true;
+    // Standard substitutions are 'S' + lowercase letter; "S0_", "S1_", ...
+    // are user-defined substitutions and must not match.
+    return i + 1 < mangled.size() && mangled[i] == 'S' &&
+           mangled[i + 1] >= 'a' && mangled[i + 1] <= 'z';
 }
 
-/// Lexically resolve ".", ".." and repeated separators in an absolute path so
-/// prefix comparisons against the application's source tree are reliable
-/// (compilers emit paths like "/usr/lib/gcc/.../13/../../../../include/c++/13").
-/// Relative paths are returned unchanged.
+/// Normalize a path lexically (no filesystem access): collapse "//", drop "."
+/// and resolve "..". Needed because compiler debug paths can contain ".."
+/// segments, e.g. "/usr/lib/gcc/.../13/../../../../include/c++/13".
+/// Relative paths retain leading ".." components; absolute paths stop at "/".
 static std::string normalizePath(const std::string& path) {
-    if (path.empty() || path[0] != '/')
-        return path;
+    if (path.empty()) return {};
+    const bool absolute = path[0] == '/';
     std::vector<std::string> parts;
     size_t i = 0;
     while (i < path.size()) {
@@ -78,28 +105,34 @@ static std::string normalizePath(const std::string& path) {
         if (part == ".")
             continue;
         if (part == "..") {
-            if (!parts.empty()) parts.pop_back();
+            if (!parts.empty() && parts.back() != "..")
+                parts.pop_back();
+            else if (!absolute)
+                parts.push_back(std::move(part));
             continue;
         }
         parts.push_back(std::move(part));
     }
-    std::string out;
+    std::string out = absolute ? "/" : "";
     for (const std::string& part : parts) {
-        out += '/';
+        if (!out.empty() && out.back() != '/') out += '/';
         out += part;
     }
-    return out.empty() ? "/" : out;
+    return out.empty() ? (absolute ? "/" : ".") : out;
 }
 
-/// True when \p file lies strictly below \p dir (directory boundary checked).
+/// True if \p file is strictly inside \p dir. The trailing '/' check prevents
+/// "/app-old/x" from matching "/app".
 static bool isUnderDir(const std::string& file, const std::string& dir) {
+    if (dir.empty()) return false;
+    if (dir == "/") return file.size() > 1 && file[0] == '/';
     return file.size() > dir.size() &&
            file.compare(0, dir.size(), dir) == 0 &&
            file[dir.size()] == '/';
 }
 
-/// Join a DIFile's directory and filename. Clang usually emits absolute
-/// filenames; the directory is prefixed only for relative ones.
+/// Combine a DIFile's directory and filename. Clang normally emits absolute
+/// filenames, so the directory is only used when the filename is relative.
 static std::string joinPath(const std::string& dir, const std::string& name) {
     if (name.empty()) return {};
     if (name[0] == '/') return name;
@@ -107,27 +140,60 @@ static std::string joinPath(const std::string& dir, const std::string& name) {
     return dir.back() == '/' ? dir + name : dir + "/" + name;
 }
 
-/// Full, normalized path of a DIFile (definition site or call site).
-static std::string filePath(const llvm::DIFile* file) {
-    if (!file) return {};
-    return normalizePath(joinPath(file->getDirectory().str(),
-                                  file->getFilename().str()));
+/// Return the normalized absolute path of a DIFile (definition or call site).
+/// Relative paths are made absolute and symlinks resolved so the result can be
+/// compared with the normalized application roots.
+///
+/// Results are memoized by absolute path. A large module references the same
+/// handful of system/user headers from thousands of functions and compile
+/// units, and every weakly_canonical() call walks the filesystem (symlink
+/// resolution + stat). The cache turns that into one lookup per unique file.
+/// The returned reference stays valid for the process lifetime.
+static const std::string& filePath(const llvm::DIFile* file) {
+    static const std::string empty;
+    if (!file) return empty;
+    std::string path = joinPath(file->getDirectory().str(),
+                                file->getFilename().str());
+    if (path.empty()) return empty;
+    if (path[0] != '/') {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::absolute(path, ec);
+        if (!ec) path = p.string();
+    }
+    static std::unordered_map<std::string, std::string> cache;
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+    std::error_code ec;
+    std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+    std::string result = normalizePath(ec ? path : canonical.string());
+    return cache.emplace(std::move(path), std::move(result)).first->second;
 }
 
-/// Best-effort application directories when the caller supplied no explicit
-/// roots. Do not add parent directories: a parent may contain unrelated
-/// third-party or generated code. Projects with separate source/header trees
-/// should pass those roots explicitly.
+/// Guess application source directories when no roots are supplied.
+///
+/// Include both compile-unit directories and the directories of every function
+/// with a definition: inline/template functions defined in a separate include/
+/// tree would otherwise look like library code.
+///
+/// System headers are skipped, and parent directories are deliberately not
+/// added -- a parent may contain unrelated third-party or generated code.
 static std::vector<std::string> buildAppSourceDirs(const llvm::Module& M) {
     std::vector<std::string> dirs;
-    for (const llvm::DICompileUnit* cu : M.debug_compile_units()) {
-        const llvm::DIFile* file = cu ? cu->getFile() : nullptr;
-        if (!file) continue;
-        std::string source = filePath(file);
-        if (source.empty()) continue;
+    auto addParentDir = [&dirs](const std::string& source) {
+        if (source.empty() || isSystemHeaderFile(source)) return;
         size_t slash = source.rfind('/');
         if (slash != std::string::npos && slash > 0)
             dirs.push_back(source.substr(0, slash));
+    };
+    for (const llvm::DICompileUnit* cu : M.debug_compile_units()) {
+        const llvm::DIFile* file = cu ? cu->getFile() : nullptr;
+        if (file) addParentDir(filePath(file));
+    }
+    for (const llvm::Function& F : M) {
+        if (F.isDeclaration()) continue;
+        const llvm::DISubprogram* sp = F.getSubprogram();
+        if (sp) addParentDir(filePath(sp->getFile()));
     }
     std::sort(dirs.begin(), dirs.end());
     dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
@@ -143,24 +209,75 @@ static std::vector<std::string> normalizeAppSourceRoots(
         std::filesystem::path path(root);
         if (path.is_relative())
             path = std::filesystem::absolute(path, ec);
+        if (!ec) {
+            std::filesystem::path canonical =
+                std::filesystem::weakly_canonical(path, ec);
+            if (!ec) path = canonical;
+        }
         if (ec) {
-            llvm::errs() << "[ERROR] cannot resolve application source root \""
-                         << root << "\": " << ec.message() << "\n";
+            llvm::errs() << "[WARN] cannot resolve application source root \""
+                         << root << "\": " << ec.message() << "; ignoring\n";
             continue;
         }
-        dirs.push_back(normalizePath(path.lexically_normal().string()));
+        dirs.push_back(normalizePath(path.string()));
     }
     std::sort(dirs.begin(), dirs.end());
     dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+    if (dirs.empty())
+        llvm::errs() << "[WARN] no usable application source root; falling "
+                        "back to compile-unit directories\n";
     return dirs;
 }
 
-/// Debug-info-independent exclusion test: std::/__gnu_cxx:: symbols (read from
-/// the mangled name so return-type-prefixed template instantiations are caught),
-/// the C++ ABI, unwinder, sanitizer and hardening runtime families, and the
-/// allocation operators. The C library has no namespace and is classified by
-/// its definition file in isExcluded(). User callbacks reached from inside
-/// these functions are still reported.
+/// Recognize only the standard, replaceable global operator new/delete forms.
+///
+/// size_t appears as "unsigned long" (LP64) or "unsigned int" (ILP32);
+/// std::align_val_t is the C++17 over-aligned variant. Any other signature,
+/// e.g. "operator new(unsigned long, MyPool&)", is user code and must remain
+/// visible.
+static bool isStandardAllocationFunction(const std::string& demangled) {
+    static const std::vector<std::string> kStandard = [] {
+        std::vector<std::string> out = {"operator delete(void*)",
+                                        "operator delete[](void*)"};
+        for (const char* size : {"unsigned long", "unsigned int"}) {
+            const std::string s(size);
+            out.push_back("operator new(" + s + ")");
+            out.push_back("operator new[](" + s + ")");
+            out.push_back("operator new(" + s + ", std::nothrow_t const&)");
+            out.push_back("operator new[](" + s + ", std::nothrow_t const&)");
+            out.push_back("operator new(" + s + ", std::align_val_t)");
+            out.push_back("operator new[](" + s + ", std::align_val_t)");
+            out.push_back("operator new(" + s +
+                          ", std::align_val_t, std::nothrow_t const&)");
+            out.push_back("operator new[](" + s +
+                          ", std::align_val_t, std::nothrow_t const&)");
+            out.push_back("operator delete(void*, " + s + ")");
+            out.push_back("operator delete[](void*, " + s + ")");
+            out.push_back("operator delete(void*, std::nothrow_t const&)");
+            out.push_back("operator delete[](void*, std::nothrow_t const&)");
+            out.push_back("operator delete(void*, std::align_val_t)");
+            out.push_back("operator delete[](void*, std::align_val_t)");
+            out.push_back("operator delete(void*, " + s + ", std::align_val_t)");
+            out.push_back("operator delete[](void*, " + s + ", std::align_val_t)");
+            out.push_back("operator delete(void*, std::align_val_t, "
+                          "std::nothrow_t const&)");
+            out.push_back("operator delete[](void*, std::align_val_t, "
+                          "std::nothrow_t const&)");
+        }
+        return out;
+    }();
+    return std::find(kStandard.begin(), kStandard.end(), demangled) !=
+           kStandard.end();
+}
+
+/// Identify standard-library and runtime symbols by name alone (no debug info
+/// required):
+///   - std:: / __gnu_cxx::  (from the mangled name, see above)
+///   - C++ ABI, unwinder, sanitizer and hardening runtimes
+///   - standard allocation operators
+///
+/// The C library has no namespace; it is classified by definition file in
+/// isExcluded(). User callbacks reached from these functions are still shown.
 static bool isStdLibFunction(const std::string& mangled,
                              const std::string& demangled) {
     if (isStdNamespaceMangled(mangled)) return true;
@@ -168,13 +285,13 @@ static bool isStdLibFunction(const std::string& mangled,
     static constexpr const char* kRuntimePrefixes[] = {
         "__cxa_", "__gxx_", "_Unwind_",       // C++ ABI / unwinder
         "__asan_", "__ubsan_", "__tsan_", "__msan_", "__sanitizer_",
-        "__stack_chk_", "__fortify_",         // hardening hooks
+        "__stack_chk_", "__fortify_",         // stack protector / fortify hooks
         "__libc_", "__GI_", "__pthread_", "__emutls_", "__tls_",
-        "__aeabi_", "__builtin_", "llvm.", // libc/compiler/emulated TLS helpers
+        "__aeabi_", "__builtin_", "llvm.", // libc / compiler / TLS helpers
         "_GLOBAL__sub_I_", "__cxx_global_var_init",
         "__do_global_dtors_aux", "__do_global_ctors_aux",
         "register_tm_clones", "deregister_tm_clones", "frame_dummy",
-        ".llvm.",                               // LLVM-generated helper names
+        ".llvm.",                            // LLVM-generated helpers
     };
     for (const char* prefix : kRuntimePrefixes)
         if (demangled.rfind(prefix, 0) == 0 ||
@@ -183,10 +300,9 @@ static bool isStdLibFunction(const std::string& mangled,
 
     if (demangled == "__clang_call_terminate") return true;
 
-    // Standard C runtime functions and fortified/versioned variants.  Keep
-    // this exact-name-based (rather than matching every "malloc*" or "free*")
-    // so application functions such as malloc_helper, free_cache or
-    // pthread_custom are not mistaken for runtime symbols.
+    // Standard C runtime and fortified/versioned variants. Use exact names, not
+    // "malloc*"/"free*" prefixes, so user code like "malloc_helper" or
+    // "free_cache" is not hidden.
     static constexpr const char* kRuntimeNames[] = {
         "malloc", "calloc", "realloc", "reallocarray", "aligned_alloc",
         "memalign", "posix_memalign", "valloc", "pvalloc",
@@ -195,6 +311,20 @@ static bool isStdLibFunction(const std::string& mangled,
         "strlen", "strnlen", "strcpy", "strncpy", "stpcpy",
         "strcat", "strncat", "strcmp", "strncmp", "strchr", "strrchr",
         "strdup", "strndup", "strerror", "strtol", "strtoul",
+        "strtoll", "strtoull", "strtof", "strtod", "strtold",
+        "strtok", "strstr", "strcasestr", "strspn", "strcspn", "strpbrk",
+        "strcasecmp", "strncasecmp", "memchr", "memrchr", "memccpy",
+        "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+        "vsprintf", "vsnprintf", "puts", "fputs", "putchar", "fputc",
+        "getchar", "fgetc", "getc", "fgets", "ungetc", "scanf", "fscanf",
+        "sscanf", "vscanf", "vfscanf", "vsscanf", "fopen", "freopen",
+        "fclose", "fread", "fwrite", "fseek", "ftell", "rewind", "fflush",
+        "fileno", "perror", "tmpfile", "setbuf", "setvbuf",
+        "abort", "exit", "_exit", "atexit", "quick_exit", "qsort", "bsearch",
+        "isalnum", "isalpha", "iscntrl", "isdigit", "isgraph", "islower",
+        "isprint", "ispunct", "isspace", "isupper", "isxdigit",
+        "tolower", "toupper", "__ctype_b_loc", "__ctype_tolower_loc",
+        "__ctype_toupper_loc",
         "__libc_malloc", "__libc_calloc", "__libc_realloc",
         "__libc_free", "__libc_cfree",
         "__malloc", "__calloc", "__realloc", "__free",
@@ -218,9 +348,9 @@ static bool isStdLibFunction(const std::string& mangled,
         if (demangled == name)
             return true;
 
-    // Linux IFUNC/symbol-versioned implementations append ".isa"/".sse4",
-    // ".avx2", etc.  Only known runtime names are versioned; e.g.
-    // "memcpy_custom" remains application code.
+    // Linux IFUNC variants append ".sse4", ".avx2", ".generic", ".ifunc", etc.
+    // Only the exact runtime names above are versioned -- "memcpy_custom"
+    // stays application code.
     for (const char* name : kRuntimeNames) {
         if (demangled.compare(0, std::strlen(name), name) == 0 &&
             demangled[std::strlen(name)] == '.') {
@@ -234,40 +364,22 @@ static bool isStdLibFunction(const std::string& mangled,
         }
     }
 
-    // operator new/delete: standard signatures only.  A custom signature such
-    // as operator new(unsigned long, MyPool&) is application code.
-    if (demangled == "operator new(unsigned long)" ||
-        demangled == "operator new(unsigned long, std::nothrow_t const&)" ||
-        demangled == "operator new[](unsigned long)" ||
-        demangled == "operator new[](unsigned long, std::nothrow_t const&)") {
-        return true;
-    }
-    if (demangled.rfind("operator delete(unsigned long", 0) == 0 ||
-        demangled.rfind("operator delete[](unsigned long", 0) == 0) {
-        // Sized deallocation and standard unsized forms.  Require either a
-        // closing standard parameter list or no extra application pool argument.
-        if (demangled == "operator delete(void*)" ||
-            demangled == "operator delete(void*, unsigned long)" ||
-            demangled == "operator delete(void*, std::nothrow_t const&)" ||
-            demangled == "operator delete[](void*)" ||
-            demangled == "operator delete[](void*, unsigned long)" ||
-            demangled == "operator delete[](void*, std::nothrow_t const&)")
-            return true;
-    }
-    return demangled == "operator delete(void*)" ||
-           demangled == "operator delete[](void*)";
+    // Standard allocation operators only; custom pool arguments stay visible.
+    return isStandardAllocationFunction(demangled);
 }
 
-/// Fallback when the module has no compile units: Linux system headers all
-/// live under /usr/. Also used for call sites.
+/// Fallback file test: Linux system headers live under /usr/. Used when the
+/// module has no compile units, and for call sites.
 bool isSystemHeaderFile(const std::string& file) {
     return isUnderDir(file, "/usr");
 }
 
-/// Line range and definition file from a function's DISubprogram. The start
-/// line is the signature; the end line is the largest debug line among the
-/// function's own (non-inlined) instructions. hasInfo stays false when the
-/// bitcode has no debug info (not built with -g).
+/// Extract a function's source span and definition file from debug info.
+///   start   - the signature line from DISubprogram
+///   end     - the largest line among the function's own instructions
+///             (inlined callee instructions are ignored)
+///
+/// hasInfo remains false when the bitcode was built without -g.
 static FuncLineRange getFuncLineRange(const llvm::Function& F) {
     FuncLineRange range;
     const llvm::DISubprogram* sp = F.getSubprogram();
@@ -281,7 +393,7 @@ static FuncLineRange getFuncLineRange(const llvm::Function& F) {
     for (const llvm::BasicBlock& bb : F) {
         for (const llvm::Instruction& inst : bb) {
             const llvm::DILocation* loc = inst.getDebugLoc();
-            if (!loc || loc->getInlinedAt()) continue; // skip inlined callee code
+            if (!loc || loc->getInlinedAt()) continue;  // ignore inlined callees
             range.end = std::max(range.end, loc->getLine());
         }
     }
@@ -312,15 +424,25 @@ FunctionFilter FunctionFilter::build(
             }
             definedFunctions.insert(name);
             FuncLineRange range = getFuncLineRange(F);
-            if (range.hasInfo)
-                filter.lineRanges_[name] = std::move(range);
+            if (range.hasInfo) {
+                // Maps are keyed by symbol name. Two modules may define
+                // same-named internal symbols: keep the first and warn, rather
+                // than silently overwriting it.
+                if (filter.lineRanges_.count(name))
+                    llvm::errs() << "[WARN] duplicate definition of \"" << name
+                                 << "\" from multiple modules; using the first "
+                                    "definition's location\n";
+                else
+                    filter.lineRanges_.emplace(name, std::move(range));
+            }
         }
     }
     for (const std::string& name : definedFunctions)
         filter.externalDecls_.erase(name);
-    if (!appSourceRoots.empty()) {
+    if (!appSourceRoots.empty())
         filter.appDirs_ = normalizeAppSourceRoots(appSourceRoots);
-    } else {
+    if (filter.appDirs_.empty()) {
+        // No usable explicit roots -- fall back to the modules' debug info.
         for (const llvm::Module* module : modules) {
             if (!module) continue;
             std::vector<std::string> dirs = buildAppSourceDirs(*module);
@@ -333,8 +455,8 @@ FunctionFilter FunctionFilter::build(
         std::unique(filter.appDirs_.begin(), filter.appDirs_.end()),
         filter.appDirs_.end());
 
-    // One ECMAScript regex per line; a malformed expression is a configuration
-    // error, not a reason to abort the analysis, so report and skip it.
+    // One ECMAScript regex per line. A bad pattern is a configuration error:
+    // warn and skip it rather than aborting the whole analysis.
     filter.namePatterns_.reserve(namePatterns.size());
     for (const std::string& pattern : namePatterns) {
         try {
@@ -349,14 +471,15 @@ FunctionFilter FunctionFilter::build(
     return filter;
 }
 
-/// Definition-site classification shared by isExcluded() and isAppFunction():
-/// true for library code, false for application code, nullopt when this symbol
-/// has no debug info in the module (the caller then decides from whether the
-/// module carries debug info elsewhere).
+/// Classify a symbol by where it is defined. Shared by isExcluded() and
+/// isAppFunction().
+///   true     - library code
+///   false    - application code
+///   nullopt  - no debug info for this symbol; the caller decides
 std::optional<bool> FunctionFilter::libraryByDefinition(
     const std::string& mangled) const {
-    // Body-less: only a declaration in this module. The application's own code
-    // is compiled into the bitcode, so a missing definition means library code.
+    // A declaration with no IR body is imported code. Application functions
+    // are compiled into the bitcode and always have a definition.
     if (externalDecls_.count(mangled)) return true;
     auto it = lineRanges_.find(mangled);
     if (it == lineRanges_.end()) return std::nullopt;
@@ -370,22 +493,25 @@ bool FunctionFilter::isExcluded(const std::string& mangled,
                                 const std::string& demangled) const {
     if (isStdLibFunction(mangled, demangled))
         return true;
-    // No debug info for this symbol: library/runtime code when the module does
-    // carry debug info elsewhere; unattributable when built without -g.
-    return libraryByDefinition(mangled).value_or(!lineRanges_.empty());
+    // Unknown provenance stays visible. Hiding a symbol just because another
+    // function in the module has debug info would drop every user function
+    // from a mixed -g / non--g link. std/runtime code is still caught by the
+    // name rules, imported code by the declaration test.
+    return libraryByDefinition(mangled).value_or(false);
 }
 
-/// Positive form of the definition-site test: protects user callbacks from the
-/// system-header call-site heuristic, which would otherwise hide a callback
-/// invoked from out-of-line library code.
+/// Positive counterpart of libraryByDefinition(). Keeps user callbacks visible
+/// even when the call site sits in a system header. Unknown provenance is also
+/// treated as application code, since a callback may come from a TU built
+/// without -g.
 bool FunctionFilter::isAppFunction(const std::string& mangled) const {
     const std::optional<bool> library = libraryByDefinition(mangled);
-    return library && !*library;
+    return !library || !*library;
 }
 
-/// Substring regex match against the demangled signature, the parameter-
-/// stripped name and the raw mangled symbol (so filters can target one
-/// overload). The second search is skipped when both demangled forms coincide.
+/// Regex-search the demangled signature, the name without parameters, and the
+/// mangled symbol (allowing filters to select a single overload). The second
+/// search is skipped when both demangled forms are identical.
 bool FunctionFilter::isFiltered(const std::string& mangled,
                                 const std::string& demangled) const {
     if (namePatterns_.empty()) return false;
@@ -398,8 +524,8 @@ bool FunctionFilter::isFiltered(const std::string& mangled,
     return false;
 }
 
-/// Line range recorded for \p mangled, or nullptr when the module has no debug
-/// info for it.
+/// Return the recorded source span for \p mangled, or nullptr if debug info is
+/// unavailable.
 const FuncLineRange* FunctionFilter::findLineRange(
     const std::string& mangled) const {
     auto it = lineRanges_.find(mangled);

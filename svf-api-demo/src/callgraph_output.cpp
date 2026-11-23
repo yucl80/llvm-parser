@@ -13,10 +13,9 @@
 #include <fstream>
 #include <optional>
 #include <ostream>
-#include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 using namespace SVF;
@@ -78,6 +77,24 @@ static const std::optional<CallSiteLoc>& getMinCallSiteLoc(
 /// (unique per function; the name string is only materialized on a miss).
 using FuncInfoCache = std::unordered_map<const FunObjVar*, FuncInfo>;
 
+/// Intern mangled names to dense IDs. The report's `reachable_funcs` count is
+/// defined over unique names, not unique FunObjVars, so two same-named
+/// definitions from different modules must still count once. Keys are views of
+/// SVF-owned names, which outlive this per-report interner, so no extra string
+/// copies are stored here.
+struct NameInterner {
+    std::unordered_map<std::string_view, unsigned> ids;
+
+    unsigned get(const FunObjVar* func) {
+        std::string_view name = func->getName();
+        auto it = ids.find(name);
+        if (it != ids.end()) return it->second;
+        const unsigned id = static_cast<unsigned>(ids.size());
+        ids.emplace(name, id);
+        return id;
+    }
+};
+
 /// Compute (or fetch) the descriptor for a function. isStd is only filled when
 /// excludeStd is on — otherwise nothing is excluded and the flag stays false.
 /// The user's name filters apply unconditionally, so a filtered function is
@@ -87,11 +104,13 @@ using FuncInfoCache = std::unordered_map<const FunObjVar*, FuncInfo>;
 static const FuncInfo& getFuncInfo(const FunObjVar* func,
                                    bool excludeStd,
                                    const FunctionFilter& filter,
-                                   FuncInfoCache& cache) {
+                                   FuncInfoCache& cache,
+                                   NameInterner& interner) {
     auto it = cache.find(func);
     if (it != cache.end()) return it->second;
     FuncInfo info;
     info.mangled = func->getName();
+    info.reachId = interner.get(func);
     const std::string& demangled = demangleFuncName(info.mangled);
     info.function = stripParams(demangled);
     // Never emit a nameless span: if a demangled form ever defeats the
@@ -112,13 +131,60 @@ static const FuncInfo& getFuncInfo(const FunObjVar* func,
     return cache.emplace(func, std::move(info)).first->second;
 }
 
+/// Reachability bookkeeping for one entry. A call tree re-visits the same
+/// name on many paths, so counting distinct names through a
+/// `unordered_set<string>` hashes a long mangled symbol for every span. Names
+/// are interned once per function; each mark is then an O(1) vector probe
+/// against the current entry's epoch, with no string hashing or allocation
+/// after the first visit.
+struct ReachableTracker {
+    unsigned epoch = 0;
+    unsigned count = 0;
+    std::vector<unsigned> seen;  ///< epoch stamp per interned mangled name
+
+    void mark(const FuncInfo& info) {
+        if (info.reachId >= seen.size())
+            seen.resize(info.reachId + 1, 0);
+        unsigned& stamp = seen[info.reachId];
+        if (stamp != epoch) {
+            stamp = epoch;
+            ++count;
+        }
+    }
+};
+
+/// Cycle-cut bookkeeping for one entry. The call tree re-visits nodes once per
+/// path, so a std::set here allocated a red-black-tree node on every push/pop.
+/// SVF CallGraphNodes carry dense ids; an epoch-stamped array indexed by that
+/// id makes probe/push/pop O(1) with no allocation after the first visit. A
+/// fresh epoch per entry resets every stamp without clearing or rehashing.
+struct RecursionGuard {
+    unsigned epoch = 0;
+    std::vector<unsigned> stamp;
+
+private:
+    unsigned& slot(const CallGraphNode* node) {
+        auto id = node->getId();
+        if (id >= stamp.size()) stamp.resize(id + 1, 0);
+        return stamp[id];
+    }
+
+public:
+    bool contains(const CallGraphNode* node) { return slot(node) == epoch; }
+    void push(const CallGraphNode* node) { slot(node) = epoch; }
+    void pop(const CallGraphNode* node) { slot(node) = 0; }
+    void nextEpoch() { ++epoch; }  // start at 1 so a popped stamp (0) never matches
+};
+
 /// Recursively stream spans for the call graph rooted at \p node, mirroring the
 /// tree traversal (one span per call edge, cycle-cut). Each span is handed to
 /// \p sink as it is generated — the TSV sink writes it out immediately, the
 /// tree sink buffers it — so no format ever materializes the whole report
 /// unless it must; \p spanCount is the running span-id counter.
-/// \p reachable collects the set of unique function names reachable from the
-/// entry (for the per-entry summary line).
+/// \p reachable tracks the unique functions reachable from the entry via an
+/// epoch stamp (for the per-entry summary line). \p info is the descriptor the
+/// caller already computed for \p node; passing it down avoids a second cache
+/// lookup for every span.
 ///
 /// A node is hidden — no span written — when it is library code under
 /// \p excludeStd, matches a user name filter (--filter-file), or is reached
@@ -134,24 +200,24 @@ static const FuncInfo& getFuncInfo(const FunObjVar* func,
 ///     displayed nor traversed.
 /// Hidden nodes still join \p in_stack so recursion is cycle-cut.
 static void emitSpans(CallGraphNode* node,
+                      const FuncInfo& info,
                       unsigned depth,
                       const std::optional<unsigned>& parentSpanId,
                       bool indirect,
                       const std::optional<CallSiteLoc>& callLoc,
                       bool suppressSpan,
-                      std::set<CallGraphNode*>& in_stack,
+                      RecursionGuard& in_stack,
                       const FunctionFilter& filter,
                       LLVMModuleSet* modSet,
                       std::unordered_map<const CallGraphEdge*, std::optional<CallSiteLoc>>& callSiteLocCache,
                       FuncInfoCache& infoCache,
+                      NameInterner& interner,
                       SpanSink& sink,
                       unsigned& spanCount,
-                      std::unordered_set<std::string>& reachable,
+                      ReachableTracker& reachable,
                       bool excludeStd) {
     const FunObjVar* func = node->getFunction();
-    if (!func || in_stack.count(node) || func->isDeclaration()) return;
-
-    const FuncInfo& info = getFuncInfo(func, excludeStd, filter, infoCache);
+    if (!func || in_stack.contains(node) || func->isDeclaration()) return;
 
     // Hidden = library code, filter match, or a library callee reached from a
     // system-header call site. A user function is never hidden by the call
@@ -162,12 +228,12 @@ static void emitSpans(CallGraphNode* node,
     if (!hidden) {
         mySpanId = spanCount++;
         sink.span(info, *mySpanId, parentSpanId, indirect, depth, false, callLoc);
-        reachable.insert(info.mangled);
+        reachable.mark(info);
     }
 
     if (node->OutEdgeBegin() == node->OutEdgeEnd()) return;
 
-    in_stack.insert(node);
+    in_stack.push(node);
 
     // Depth / parent for the next emitted node: bump only past emitted nodes.
     const std::optional<unsigned> childParent = hidden ? parentSpanId : mySpanId;
@@ -178,12 +244,19 @@ static void emitSpans(CallGraphNode* node,
         CallGraphNode* callee = edge->getDstNode();
         if (!callee->getFunction()) continue;
 
+        const FuncInfo& ci = getFuncInfo(callee->getFunction(), excludeStd,
+                                         filter, infoCache, interner);
+        // Rule 3 early exit: a hidden caller never follows an edge into a
+        // callee already hidden by std/filter classification. Check this
+        // before the call-site lookup — that lookup (and its first-time debug
+        // info walk) is the expensive part, especially with many library
+        // edges. The suppress-by-call-site case below still needs it.
+        if (hidden && (ci.isStd || ci.filtered)) continue;
+
         const bool childIndirect = edge->isIndirectCallEdge();
         const std::optional<CallSiteLoc>& cl =
             getMinCallSiteLoc(edge, modSet, callSiteLocCache);
 
-        const FuncInfo& ci = getFuncInfo(callee->getFunction(), excludeStd,
-                                         filter, infoCache);
         // Release-build fallback (no debug info): a call made inside a system
         // include header marks the callee as library code — but never hides a
         // user function, whose span is required by rule 2.
@@ -197,20 +270,20 @@ static void emitSpans(CallGraphNode* node,
         // hidden callee, which is how the callbacks it invokes are reported.
         if (hidden && calleeHidden) continue;
 
-        if (in_stack.count(callee)) {
+        if (in_stack.contains(callee)) {
             // Cycle back-edge: record the span but do not expand its subtree.
             if (calleeHidden) continue;
             sink.span(ci, spanCount++, childParent, childIndirect, childDepth,
                       true, cl);
-            reachable.insert(ci.mangled);
+            reachable.mark(ci);
             continue;
         }
 
-        emitSpans(callee, childDepth, childParent, childIndirect, cl,
+        emitSpans(callee, ci, childDepth, childParent, childIndirect, cl,
                   calleeSuppress, in_stack, filter, modSet, callSiteLocCache,
-                  infoCache, sink, spanCount, reachable, excludeStd);
+                  infoCache, interner, sink, spanCount, reachable, excludeStd);
     }
-    in_stack.erase(node);
+    in_stack.pop(node);
 }
 
 /// Write the #-prefixed metadata header. Per-entry span lines are streamed
@@ -307,31 +380,38 @@ void writeCallGraphReport(const llvm::Module& M,
                                 : static_cast<SpanSink&>(tsvSink);
     LLVMModuleSet* modSet = LLVMModuleSet::getLLVMModuleSet();
     std::unordered_map<const CallGraphEdge*, std::optional<CallSiteLoc>> callSiteLocCache;
+    NameInterner interner;
     FuncInfoCache infoCache;
     infoCache.reserve(M.size());  // upper bound on unique functions
     writeHeader(os, M, config, entryNames);
+    ReachableTracker reachable;
+    RecursionGuard in_stack;  // stamp vector reused across entries
     for (const std::string& name : entryNames) {
         CallGraphNode* entryNode = resolveEntry(callGraph, name);
         if (!entryNode) {
             llvm::errs() << "[WARN] entry function not found: " << name << "\n";
             continue;
         }
-        if (getFuncInfo(entryNode->getFunction(), config.excludeStd, filter,
-                        infoCache)
-                .filtered) {
+        const FuncInfo& entryInfo = getFuncInfo(entryNode->getFunction(),
+                                                config.excludeStd, filter,
+                                                infoCache, interner);
+        if (entryInfo.filtered) {
             llvm::errs() << "[WARN] entry function matches a filter pattern, "
                             "skipped: " << name << "\n";
             continue;
         }
         sink.beginEntry(name);
+        // A new epoch makes every cached FuncInfo unvisited again for this
+        // entry without clearing or rehashing a set.
+        ++reachable.epoch;
+        reachable.count = 0;
+        in_stack.nextEpoch();
         unsigned spanCount = 0;
-        std::set<CallGraphNode*> in_stack;
-        std::unordered_set<std::string> reachable;
-        reachable.reserve(M.size());
-        emitSpans(entryNode, 0, std::nullopt, /*indirect=*/false, std::nullopt,
-                  false, in_stack, filter, modSet, callSiteLocCache, infoCache,
-                  sink, spanCount, reachable, config.excludeStd);
-        sink.endEntry(name, spanCount, reachable.size());
+        emitSpans(entryNode, entryInfo, 0, std::nullopt, /*indirect=*/false,
+                  std::nullopt, false, in_stack, filter, modSet,
+                  callSiteLocCache, infoCache, interner, sink, spanCount,
+                  reachable, config.excludeStd);
+        sink.endEntry(name, spanCount, reachable.count);
     }
     os.flush();
     if (os.good() && fb.close())

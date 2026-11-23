@@ -76,6 +76,10 @@ bool parseArgs(int argc, char** argv, ClassOptions& options,
                 }
                 options.format = value;
             } else if (arg == "--output") {
+                if (value.empty()) {
+                    error = "--output requires a non-empty file name";
+                    return false;
+                }
                 options.output = value;
             } else {
                 if (value != "auto" && value != "bitcode" &&
@@ -96,6 +100,10 @@ bool parseArgs(int argc, char** argv, ClassOptions& options,
         } else if (arg.rfind("--", 0) == 0) {
             error = "unknown option: " + arg;
             return false;
+        } else if (arg.size() > 1 && arg[0] == '-') {
+            error = "unknown option: " + arg +
+                    " (pass clang arguments after --)";
+            return false;
         } else {
             options.inputs.push_back(arg);
         }
@@ -110,6 +118,17 @@ bool parseArgs(int argc, char** argv, ClassOptions& options,
 /// Resolve the backend for all inputs, rejecting mixed input kinds.
 bool resolveInputType(const ClassOptions& options, InputType& type,
                       std::string& error) {
+    // Validate every input up front: an explicit --input-type must not bypass
+    // the existence check, and the source backend cannot distinguish a missing
+    // file from an empty translation unit on its own.
+    for (const std::string& input : options.inputs) {
+        std::ifstream probe(input, std::ios::binary);
+        if (!probe) {
+            error = "cannot open input file: " + input;
+            return false;
+        }
+    }
+
     if (options.inputType == "bitcode") {
         type = InputType::Bitcode;
         return true;
@@ -165,14 +184,18 @@ int main(int argc, char** argv) {
     }
 
     if (type == InputType::Bitcode &&
-        (options.allHeaders || !options.clangArgs.empty()))
+        (options.allHeaders || !options.clangArgs.empty())) {
         std::fprintf(stderr,
-                     "[WARN] --all and -- <clang args> only apply to source "
-                     "inputs; ignored\n");
-    if (type == InputType::Source && options.includeLibrary)
+                     "[ERROR] --all and -- <clang args> only apply to source "
+                     "inputs\n");
+        return 1;
+    }
+    if (type == InputType::Source && options.includeLibrary) {
         std::fprintf(stderr,
-                     "[WARN] --include-library only applies to bitcode "
-                     "inputs; ignored\n");
+                     "[ERROR] --include-library only applies to bitcode "
+                     "inputs\n");
+        return 1;
+    }
 
     ClassReport report;
     report.inputs = options.inputs;

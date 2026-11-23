@@ -36,7 +36,7 @@ bool isSystemHeaderFile(const std::string& file);
 /// classification must run while SVF's ExtAPI stubs do not yet exist, or an
 /// imported declaration would look like a definition.
 ///
-/// A function is hidden when any of four signals fires, from strongest to
+/// A function is hidden when any of three signals fires, from strongest to
 /// weakest:
 ///  1. the symbol's namespace marks it as C++ standard-library / runtime code
 ///     (isStdLibFunction — works with and without debug info);
@@ -47,9 +47,11 @@ bool isSystemHeaderFile(const std::string& file);
 ///  3. it is defined outside the application's source tree: libstdc++/glibc
 ///     headers such as gthr-default.h, C library sources linked into the
 ///     module, third-party library code. This is where the C library is
-///     recognised — by the file the function is defined in, not by its name;
-///  4. it has no debug info at all while the module carries debug info
-///     elsewhere.
+///     recognised — by the file the function is defined in, not by its name.
+///
+/// A symbol with no debug info is kept visible: hiding it just because another
+/// function in the module has debug info would drop all user functions from a
+/// mixed -g / non--g link. std/runtime code is still caught by signal 1.
 ///
 /// Independently of that classification, the user can name functions to hide
 /// with a filter file (one ECMAScript regular expression per line, see
@@ -65,7 +67,8 @@ public:
     /// the user's filter file content; an invalid expression is reported and
     /// skipped. When \p appSourceRoots is non-empty, only files below those
     /// directories are considered application code. Otherwise the compile
-    /// unit directories are used as a best-effort fallback.
+    /// unit and debug-info definition directories are used as a best-effort
+    /// fallback (the latter covers separate include/ trees).
     static FunctionFilter build(const llvm::Module& M,
                                 const std::vector<std::string>& namePatterns = {},
                                 const std::vector<std::string>& appSourceRoots = {});

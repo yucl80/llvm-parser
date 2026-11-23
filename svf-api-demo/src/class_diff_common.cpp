@@ -188,6 +188,11 @@ bool initProject(const std::string& Arg, const Options& O, Snapshot& S,
         S.root = normPath(Given.parent_path().string());
         if (!S.root.empty() && S.root.back() != '/')
             S.root += '/';
+        const std::string Rel =
+            startsWith(File, S.root) ? File.substr(S.root.size())
+                                     : fs::path(File).filename().generic_string();
+        if (isIgnored(Rel, O.ignores))
+            return true;
         if (isBitcodeFile(File))
             S.bitcodes.push_back(File);
         else
@@ -227,6 +232,11 @@ bool initProject(const std::string& Arg, const Options& O, Snapshot& S,
             else if (isSourceFile(Rel))
                 S.sources.push_back(Abs);
         }
+    }
+    if (EC) {
+        Error = "error while scanning project path: " + Arg + ": " +
+                EC.message();
+        return false;
     }
     for (auto* List : {&S.sources, &S.bitcodes}) {
         std::sort(List->begin(), List->end());
@@ -301,6 +311,8 @@ std::vector<std::string> methodReasons(const MethodRecord& A,
         R.push_back("declaration");
     if (A.bodyHash != B.bodyHash)
         R.push_back("implementation");
+    if (A.hasDecl != B.hasDecl || A.hasDef != B.hasDef)
+        R.push_back("availability");
     return R;
 }
 
@@ -331,9 +343,17 @@ static ClassDiff diffClass(const std::string& Name, const ClassRecord* Old,
         return D;
     }
 
-    for (const char* Part : {"kind", "bases", "fields", "aliases"})
-        if (classState(*Old, Part) != classState(*New, Part))
+    for (const char* Part : {"kind", "bases", "fields", "aliases"}) {
+        const std::string OldState = classState(*Old, Part);
+        const std::string NewState = classState(*New, Part);
+        if (OldState != NewState) {
             D.classReasons.push_back(Part);
+            D.classDetails.push_back(
+                std::string(Part) + ": " +
+                (OldState.empty() ? "<none>" : OldState) + " -> " +
+                (NewState.empty() ? "<none>" : NewState));
+        }
+    }
 
     std::set<std::string> Keys;
     for (const auto& KV : Old->methods)
@@ -411,6 +431,8 @@ void writeText(FILE* Out, const Snapshot& Old, const Snapshot& New,
             std::fprintf(Out, "  (class %s changed)",
                          join(C.classReasons, ", ").c_str());
         std::fputc('\n', Out);
+        for (const std::string& Detail : C.classDetails)
+            std::fprintf(Out, "    ! %s\n", Detail.c_str());
         if (C.methods.empty())
             std::fputs("    (no method changes)\n", Out);
         for (const MethodDiff& M : C.methods) {
@@ -474,6 +496,10 @@ void writeJson(FILE* Out, const Snapshot& Old, const Snapshot& New,
         for (size_t J = 0; J < C.classReasons.size(); ++J)
             std::fprintf(Out, "%s\"%s\"", J ? ", " : "",
                          jsonEscape(C.classReasons[J]).c_str());
+        std::fputs("], \"class_details\": [", Out);
+        for (size_t J = 0; J < C.classDetails.size(); ++J)
+            std::fprintf(Out, "%s\"%s\"", J ? ", " : "",
+                         jsonEscape(C.classDetails[J]).c_str());
         std::fputs("], \"methods\": [", Out);
         for (size_t J = 0; J < C.methods.size(); ++J) {
             const MethodDiff& M = C.methods[J];

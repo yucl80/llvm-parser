@@ -25,6 +25,10 @@ int main(int argc, char **argv) {
         printSqlUsage(argv[0]);
         return 1;
     }
+    if (Options.help) {
+        printSqlUsage(argv[0]);
+        return 0;
+    }
 
     SqlReport Report;
     if (!extractSqlFromSource(Options, Report, Error)) {
@@ -42,8 +46,8 @@ int main(int argc, char **argv) {
             ++Resolved;
     std::fprintf(stderr,
                  "[sql_extractor] files=%zu statements=%zu resolved=%zu "
-                 "dynamic=%zu\n",
+                 "dynamic=%zu parse_errors=%zu\n",
                  Report.inputs.size(), Report.statements.size(), Resolved,
-                 Report.unresolved);
+                 Report.unresolved, Report.parseErrors);
     return 0;
 }
