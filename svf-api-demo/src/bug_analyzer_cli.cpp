@@ -3,6 +3,7 @@
 
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -22,14 +23,20 @@ struct Options {
     std::string format = "text";
     std::string output;
     std::vector<std::string> inputs;
+    std::vector<std::string> localApis;
+    std::vector<std::string> remoteApis;
 };
 
 void printUsage(const char* program) {
     std::fprintf(stderr,
                  "Usage: %s [--format text|json] [--output file] "
+                 "[--local-api name] [--remote-api name] "
                  "<bitcode.bc|llvm-ir.ll>...\n"
                  "\n"
                  "Scans LLVM modules for heuristic bug candidates. "
+                 "Multiple inputs are linked before analysis. "
+                 "--local-api / --remote-api are repeatable; --api is a "
+                 "legacy alias for --local-api. "
                  "Results require manual validation.\n",
                  program);
 }
@@ -41,7 +48,8 @@ bool parseArgs(int argc, char** argv, Options& options, std::string& error) {
             printUsage(argv[0]);
             std::exit(0);
         }
-        if (arg == "--format" || arg == "--output") {
+        if (arg == "--format" || arg == "--output" || arg == "--api" ||
+            arg == "--local-api" || arg == "--remote-api") {
             if (++i >= argc) {
                 error = "missing value for " + arg;
                 return false;
@@ -54,6 +62,10 @@ bool parseArgs(int argc, char** argv, Options& options, std::string& error) {
                     return false;
                 }
                 options.format = value;
+            } else if (arg == "--api" || arg == "--local-api") {
+                options.localApis.push_back(value);
+            } else if (arg == "--remote-api") {
+                options.remoteApis.push_back(value);
             } else {
                 options.output = value;
             }
@@ -114,6 +126,7 @@ void writeJson(std::ostream& output,
                << "\",\"rule\":\"" << jsonEscape(finding.rule)
                << "\",\"cwe\":\"" << jsonEscape(finding.cwe)
                << "\",\"severity\":\"" << jsonEscape(finding.severity)
+               << "\",\"confidence\":\"" << jsonEscape(finding.confidence)
                << "\",\"category\":\"" << jsonEscape(finding.category)
                << "\",\"message\":\"" << jsonEscape(finding.message)
                << "\",\"function\":\"" << jsonEscape(finding.function)
@@ -136,9 +149,9 @@ void writeText(std::ostream& output,
         output << (finding.file.empty() ? finding.input : finding.file) << ":"
                << finding.startLine << "-" << finding.endLine << ":"
                << finding.column << ": "
-               << finding.severity << " [" << finding.rule << ", "
-               << finding.cwe << "] " << finding.function << ": "
-               << finding.message << "\n";
+               << finding.severity << "/" << finding.confidence << " ["
+               << finding.rule << ", " << finding.cwe << "] "
+               << finding.function << ": " << finding.message << "\n";
     }
     output << "Note: findings are heuristic candidates and require manual "
               "validation.\n";
@@ -155,9 +168,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<buganalyzer::Finding> findings;
+    llvm::LLVMContext context;
+    std::unique_ptr<llvm::Module> linked;
     for (const std::string& input : options.inputs) {
-        llvm::LLVMContext context;
         llvm::SMDiagnostic diagnostic;
         std::unique_ptr<llvm::Module> module =
             llvm::parseIRFile(input, diagnostic, context);
@@ -169,8 +182,28 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[ERROR] %s\n", message.c_str());
             return 1;
         }
-        buganalyzer::runAnalyzers(*module, input, findings);
+        if (!linked) {
+            linked = std::move(module);
+            continue;
+        }
+        if (llvm::Linker::linkModules(*linked, std::move(module))) {
+            std::fprintf(stderr, "[ERROR] failed to link bitcode module: %s\n",
+                         input.c_str());
+            return 1;
+        }
     }
+
+    std::string inputLabel;
+    for (const std::string& input : options.inputs) {
+        if (!inputLabel.empty())
+            inputLabel += ",";
+        inputLabel += input;
+    }
+
+    buganalyzer::configureCrossProcessApis(options.localApis,
+                                            options.remoteApis);
+    std::vector<buganalyzer::Finding> findings;
+    buganalyzer::runAnalyzers(*linked, inputLabel, findings);
 
     std::sort(findings.begin(), findings.end(),
               [](const buganalyzer::Finding& left,

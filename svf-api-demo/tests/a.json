@@ -1,0 +1,64 @@
+{
+    "analysis": "heuristic candidates; manual validation required",
+    "inputs": [
+        "/tmp/cross_process_fixture.bc"
+    ],
+    "findings": [
+        {
+            "input": "/tmp/cross_process_fixture.bc",
+            "rule": "RESOURCE_LEAK",
+            "cwe": "CWE-401",
+            "severity": "medium",
+            "category": "resource-lifetime",
+            "message": "mmap acquires a mapped memory that may remain unreleased when this function exits.",
+            "function": "(anonymous namespace)::map_shared_state(char const*, unsigned long)",
+            "file": "/home/test/llvm-parser/svf-api-demo/tests/bug_analyzer_cross_process_fixture.cpp",
+            "line": 54,
+            "start_line": 54,
+            "end_line": 54,
+            "column": 9
+        },
+        {
+            "input": "/tmp/cross_process_fixture.bc",
+            "rule": "UNLOCK_WITHOUT_LOCK",
+            "cwe": "CWE-667",
+            "severity": "medium",
+            "category": "concurrency",
+            "message": "Mutex is unlocked without a recognized prior lock in this function: %19.",
+            "function": "(anonymous namespace)::run_local_worker(int, (anonymous namespace)::SharedState*)",
+            "file": "/home/test/llvm-parser/svf-api-demo/tests/bug_analyzer_cross_process_fixture.cpp",
+            "line": 84,
+            "start_line": 84,
+            "end_line": 84,
+            "column": 5
+        },
+        {
+            "input": "/tmp/cross_process_fixture.bc",
+            "rule": "LOCK_NOT_RELEASED",
+            "cwe": "CWE-667",
+            "severity": "medium",
+            "category": "concurrency",
+            "message": "Function may return while holding mutex %12.",
+            "function": "(anonymous namespace)::run_local_worker(int, (anonymous namespace)::SharedState*)",
+            "file": "/home/test/llvm-parser/svf-api-demo/tests/bug_analyzer_cross_process_fixture.cpp",
+            "line": 87,
+            "start_line": 87,
+            "end_line": 87,
+            "column": 1
+        },
+        {
+            "input": "/tmp/cross_process_fixture.bc",
+            "rule": "UNINITIALIZED_READ",
+            "cwe": "CWE-457",
+            "severity": "medium",
+            "category": "memory-safety",
+            "message": "Read of uninitialized bytes [0,8) from object '%1'.",
+            "function": "(anonymous namespace)::launch_state_dumper()",
+            "file": "/home/test/llvm-parser/svf-api-demo/tests/bug_analyzer_cross_process_fixture.cpp",
+            "line": 92,
+            "start_line": 92,
+            "end_line": 92,
+            "column": 20
+        }
+    ]
+}

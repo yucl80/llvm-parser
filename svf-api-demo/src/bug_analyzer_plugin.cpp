@@ -10,6 +10,8 @@ const std::vector<AnalyzerPlugin>& registeredAnalyzers() {
         {"unsafe-api", analyzeUnsafeApis},
         {"nested-loops", analyzeNestedLoops},
         {"resource-lifetime", analyzeResourceLifetimes},
+        {"cross-process-local", analyzeLocalCrossProcess},
+        {"cross-process-remote", analyzeRemoteCrossProcess},
     };
     return plugins;
 }

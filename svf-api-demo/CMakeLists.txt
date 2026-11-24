@@ -175,15 +175,34 @@ add_executable(bitcode_vulnerability_analyzer
     src/bug_analyzer_unsafe_api.cpp
     src/bug_analyzer_nested_loops.cpp
     src/bug_analyzer_resource_lifetime.cpp
+    src/bug_analyzer_cross_process.cpp
     include/bug_analyzer_plugin.h)
 target_compile_options(bitcode_vulnerability_analyzer PRIVATE -Wall -Wextra)
 target_include_directories(bitcode_vulnerability_analyzer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(bitcode_vulnerability_analyzer SYSTEM PRIVATE
     "${LLVM_INCLUDE_DIR}")
-target_link_libraries(bitcode_vulnerability_analyzer PRIVATE "${LLVM_LIB}")
+target_link_libraries(bitcode_vulnerability_analyzer PRIVATE svfanalyzer
+    "${LLVM_LIB}")
 set_target_properties(bitcode_vulnerability_analyzer PROPERTIES
-    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib")
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib;${SVF_ROOT}/Release-build/lib")
+
+# Cross-process test driver: loads the fixture bitcode, calls the analyzer
+# directly and prints which functions contain cross-process calls.
+add_executable(bug_analyzer_cross_process_test
+    tests/bug_analyzer_cross_process_test.cpp
+    src/bug_analyzer_common.cpp
+    src/bug_analyzer_cross_process.cpp
+    include/bug_analyzer_plugin.h)
+target_compile_options(bug_analyzer_cross_process_test PRIVATE -Wall -Wextra)
+target_include_directories(bug_analyzer_cross_process_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(bug_analyzer_cross_process_test SYSTEM PRIVATE
+    "${LLVM_INCLUDE_DIR}")
+target_link_libraries(bug_analyzer_cross_process_test PRIVATE svfanalyzer
+    "${LLVM_LIB}")
+set_target_properties(bug_analyzer_cross_process_test PROPERTIES
+    BUILD_RPATH "\$ORIGIN/lib;${LLVM_PREFIX}/lib;${SVF_ROOT}/Release-build/lib")
 
 # ---------------------------------------------------------------------------
 # Class/method change detector: ./class_diff [options] <old> <new> [-- args]
@@ -273,6 +292,14 @@ add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_web_service.bc"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_service.cpp"
     COMMENT "Compiling tests/test_web_service.cpp to LLVM bitcode")
 
+add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/bug_analyzer_cross_process_fixture.bc"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${TEST_BITCODE_DIR}"
+    COMMAND "${LLVM_PREFIX}/bin/clang++" -std=c++17 -O0 -g -emit-llvm -c
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/bug_analyzer_cross_process_fixture.cpp"
+            -o "${TEST_BITCODE_DIR}/bug_analyzer_cross_process_fixture.bc"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/bug_analyzer_cross_process_fixture.cpp"
+    COMMENT "Compiling tests/bug_analyzer_cross_process_fixture.cpp to LLVM bitcode")
+
 # SQLite fixture: source extraction and bitcode extraction share this file.
 add_custom_command(OUTPUT "${TEST_BITCODE_DIR}/test_sqlite_source.bc"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${TEST_BITCODE_DIR}"
@@ -286,6 +313,7 @@ add_custom_target(bitcode ALL DEPENDS
     "${TEST_BITCODE_DIR}/test_complex.bc"
     "${TEST_BITCODE_DIR}/test_prog.bc"
     "${TEST_BITCODE_DIR}/test_web_service.bc"
+    "${TEST_BITCODE_DIR}/bug_analyzer_cross_process_fixture.bc"
     "${TEST_BITCODE_DIR}/test_sqlite_source.bc")
 
 # ---------------------------------------------------------------------------
@@ -335,6 +363,8 @@ add_custom_target(runtime-libs ALL DEPENDS ${RUNTIME_LIB_FILES})
 # $ORIGIN/lib rpath.
 add_dependencies(class_extractor runtime-libs)
 add_dependencies(entry_extractor runtime-libs)
+add_dependencies(bitcode_vulnerability_analyzer runtime-libs)
+add_dependencies(bug_analyzer_cross_process_test runtime-libs)
 # Source inputs are handled by the same binary through its libclang rpath.
 
 # Assemble a clean self-contained deployment folder: clang_analyzer + lib/.
@@ -447,6 +477,13 @@ if(Python3_Interpreter_FOUND)
   add_bug_analyzer_regression(
       bitcode_vulnerability_analyzer_cli_regression
       bug_analyzer_cli_test.py)
+
+  # C++ cross-process test: prints the functions that contain cross-process
+  # calls and asserts that the real fixture exercises every scenario.
+  add_test(NAME bug_analyzer_cross_process_cpp_test
+      COMMAND "$<TARGET_FILE:bug_analyzer_cross_process_test>"
+              "${TEST_BITCODE_DIR}/bug_analyzer_cross_process_fixture.bc")
+  set_tests_properties(bug_analyzer_cross_process_cpp_test PROPERTIES TIMEOUT 120)
 
   # Bitcode SQL extractor suite: parses the shared SQLite fixture and asserts
   # static SQL, function/indirect-call candidates and dynamic values.

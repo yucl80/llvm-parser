@@ -120,7 +120,8 @@ with `--api`.
 
 `svf-api-demo/build/bitcode_vulnerability_analyzer` scans LLVM bitcode / IR
 (`.bc` / `.ll`) for common memory-safety, unsafe-API, concurrency,
-uninitialized-read, nested-loop and resource-lifetime issues.
+uninitialized-read, nested-loop, resource-lifetime and cross-process access
+issues.
 
 ```bash
 ./svf-api-demo/build/bitcode_vulnerability_analyzer --format json \
@@ -147,6 +148,29 @@ also summarizes direct resource-returning wrappers and simple single-block
 release wrappers. Indirect calls, custom allocators and more complex
 cross-function ownership remain outside these summaries, so findings are
 heuristic candidates rather than proof of a defect.
+
+Cross-process checks are split into two independent rules:
+`LOCAL_CROSS_PROCESS_ACCESS` covers shared memory, local IPC (pipes, POSIX/System
+V queues, process-shared synchronization), process creation and local
+cross-process memory access; `REMOTE_CROSS_PROCESS_ACCESS` covers network
+sockets and network I/O that can cross a machine boundary. `socket()` is
+classified from its address family: `AF_UNIX` is local, `AF_INET`/`AF_INET6` is
+remote, and unknown families are reported as possible remote access.
+
+Socket domains are tracked through `dup`/`dup2`/`dup3`, local slots, globals,
+casts, aggregates, `socketpair` and module-internal wrapper returns, using the
+module target triple for address-family constants. Callback user-data is bound
+to the callback parameter for common thread APIs. Both rules evaluate constant
+flags such as `MAP_SHARED`, propagate handles through locals, globals,
+parameters, callbacks and calls, and use one shared SVF pointer analysis for
+virtual dispatch, function-pointer tables and `std::function` targets.
+Unreachable blocks and constant-false branches are skipped. Multiple bitcode
+inputs are linked before analysis so cross-module calls are visible. Use
+`--local-api PATTERN` / `--remote-api PATTERN` (repeatable) to add
+project-specific APIs; `*`/`?` wildcards and demangled namespace fragments are
+supported, and `--api` remains an alias for `--local-api`. Each evidence site
+is reported separately with a structured `confidence` field. Local findings use
+`info` / `CWE-668`, remote findings use `medium` / `CWE-200`.
 
 ### SQLite SQL Scripts from Bitcode
 

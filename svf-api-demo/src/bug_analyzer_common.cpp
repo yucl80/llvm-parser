@@ -78,12 +78,14 @@ void addFinding(std::vector<Finding>& findings, const std::string& input,
                 const llvm::Function& function,
                 const llvm::Instruction& instruction, std::string rule,
                 std::string cwe, std::string severity,
-                std::string category, std::string message) {
+                std::string category, std::string message,
+                std::string confidence) {
     Finding finding;
     finding.input = input;
     finding.rule = std::move(rule);
     finding.cwe = std::move(cwe);
     finding.severity = std::move(severity);
+    finding.confidence = std::move(confidence);
     finding.category = std::move(category);
     finding.message = std::move(message);
     finding.function = displayFunctionName(function);

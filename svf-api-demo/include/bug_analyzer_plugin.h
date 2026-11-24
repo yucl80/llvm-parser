@@ -15,6 +15,7 @@ struct Finding {
     std::string rule;
     std::string cwe;
     std::string severity;
+    std::string confidence = "confirmed";
     std::string category;
     std::string message;
     std::string function;
@@ -46,7 +47,8 @@ void addFinding(std::vector<Finding>& findings, const std::string& input,
                 const llvm::Function& function,
                 const llvm::Instruction& instruction, std::string rule,
                 std::string cwe, std::string severity,
-                std::string category, std::string message);
+                std::string category, std::string message,
+                std::string confidence = "confirmed");
 
 void analyzeMemorySafety(const llvm::Module& module, const std::string& input,
                          std::vector<Finding>& findings);
@@ -61,5 +63,17 @@ void analyzeNestedLoops(const llvm::Module& module, const std::string& input,
 void analyzeResourceLifetimes(const llvm::Module& module,
                               const std::string& input,
                               std::vector<Finding>& findings);
+bool hasCrossProcessAccess(const llvm::Function& function);
+bool hasLocalCrossProcessAccess(const llvm::Function& function);
+bool hasRemoteCrossProcessAccess(const llvm::Function& function);
+void configureCrossProcessApis(const std::vector<std::string>& apis);
+void configureCrossProcessApis(const std::vector<std::string>& localApis,
+                               const std::vector<std::string>& remoteApis);
+void analyzeLocalCrossProcess(const llvm::Module& module,
+                              const std::string& input,
+                              std::vector<Finding>& findings);
+void analyzeRemoteCrossProcess(const llvm::Module& module,
+                               const std::string& input,
+                               std::vector<Finding>& findings);
 
 } // namespace buganalyzer
